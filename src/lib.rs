@@ -454,27 +454,71 @@ impl<S: Store> SegmentedStore<S> {
             ..Default::default()
         };
         while let Some(group) = self.next_merge_group() {
-            let segs: Vec<S::Segment> = group.iter().map(|&i| self.segments[i].clone()).collect();
-            let merged = {
-                let tombstones = &self.tombstones;
-                self.store
-                    .merge_segments(&segs, &|id| !tombstones.contains(id))
-            };
-            stats.items_merged += self.store.segment_len(&merged);
+            stats.items_merged += self.merge_group(group);
             stats.merges += 1;
-            // Remove the merged segments (highest index first), then append the result.
-            let mut desc = group;
-            desc.sort_unstable_by(|a, b| b.cmp(a));
-            for i in desc {
-                self.segments.remove(i);
-            }
-            self.segments.push(merged);
         }
         if stats.merges > 0 {
             self.checkpoint()?;
         }
         stats.segments_after = self.segments.len();
         Ok(stats)
+    }
+
+    /// Consolidate on demand: merge segments until at most `max_segments` remain,
+    /// ignoring the size band, the per-bucket minimum, and the [`TierConfig`] cap
+    /// (this is explicit user intent, e.g. before a read-heavy phase, so it may
+    /// produce a segment larger than `max_merged_len`). Merging to a single segment
+    /// (`max_segments <= 1`) also purges the tombstone set, exactly like
+    /// [`Self::compact`]; merging to more keeps the set (an id may live in a segment
+    /// the call did not merge). Smallest segments are merged first to keep the work
+    /// down. A no-op when already at or below `max_segments`.
+    pub fn force_merge_to(&mut self, max_segments: usize) -> PersistenceResult<CompactionStats> {
+        if max_segments <= 1 {
+            return self.compact();
+        }
+        self.flush_buffer();
+        let mut stats = CompactionStats {
+            segments_before: self.segments.len(),
+            ..Default::default()
+        };
+        while self.segments.len() > max_segments {
+            let mut idx: Vec<usize> = (0..self.segments.len()).collect();
+            idx.sort_by_key(|&i| self.store.segment_len(&self.segments[i]));
+            // Merging k segments drops the count by k-1; to remove `over` segments we
+            // merge `over + 1`, bounded by max_merge and what's available.
+            let over = self.segments.len() - max_segments;
+            let k = (over + 1)
+                .min(self.tiering.max_merge.max(2))
+                .min(self.segments.len());
+            let group: Vec<usize> = idx.into_iter().take(k).collect();
+            stats.items_merged += self.merge_group(group);
+            stats.merges += 1;
+        }
+        if stats.merges > 0 {
+            self.checkpoint()?;
+        }
+        stats.segments_after = self.segments.len();
+        Ok(stats)
+    }
+
+    /// Merge the segments at `indices` into one (dropping tombstoned ids), replacing
+    /// them in place with the single result. Returns the merged item count.
+    fn merge_group(&mut self, indices: Vec<usize>) -> usize {
+        let segs: Vec<S::Segment> = indices.iter().map(|&i| self.segments[i].clone()).collect();
+        let merged = {
+            let tombstones = &self.tombstones;
+            self.store
+                .merge_segments(&segs, &|id| !tombstones.contains(id))
+        };
+        let n = self.store.segment_len(&merged);
+        // Remove the merged segments (highest index first), then append the result.
+        let mut desc = indices;
+        desc.sort_unstable_by(|a, b| b.cmp(a));
+        for i in desc {
+            self.segments.remove(i);
+        }
+        self.segments.push(merged);
+        n
     }
 
     /// Whether at least one size bucket is eligible to merge right now.
@@ -1210,6 +1254,83 @@ mod tests {
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (2, "b".into())]);
         let _ = std::fs::remove_dir_all(&root);
     }
+    // ---- force-merge / on-demand consolidation ----
+
+    #[test]
+    fn force_merge_to_consolidates_without_data_loss() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..20u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 10 segments of size 2
+        }
+        assert_eq!(s.segment_count(), 10);
+        let stats = s.force_merge_to(3).unwrap();
+        assert!(
+            s.segment_count() <= 3,
+            "consolidated to <= 3, got {}",
+            s.segment_count()
+        );
+        assert!(stats.merges > 0);
+        assert_eq!(live_multiset(&s).len(), 20, "no data lost");
+    }
+
+    #[test]
+    fn force_merge_to_one_purges_tombstones() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..10u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        for i in 0..5u32 {
+            s.delete(i).unwrap();
+        }
+        s.force_merge_to(1).unwrap();
+        assert_eq!(s.segment_count(), 1);
+        assert_eq!(s.tombstone_count(), 0, "merge to one purges tombstones");
+        let live: Vec<u32> = live_set(&s).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(live, (5..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn force_merge_to_is_noop_when_already_small() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..4u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 2 segments
+        }
+        let stats = s.force_merge_to(5).unwrap();
+        assert_eq!(stats.merges, 0, "already at/below target, nothing to merge");
+        assert_eq!(s.segment_count(), 2);
+    }
+
+    /// Tiering rewrites each item O(log) times, so the total merged work over N
+    /// inserts is O(N log N) -- far below the O(N^2) of rebuilding everything on
+    /// each compaction, which is the cliff the max_merged_len cap exists to avoid.
+    #[test]
+    fn tiered_write_amplification_is_subquadratic() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig::default(); // min_merge 4, large cap (no freezing here)
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(4, cfg, false)).unwrap();
+        let n: u32 = 4000;
+        let mut total_merged = 0usize;
+        for i in 0..n {
+            s.add(i, format!("v{i}")).unwrap();
+            if i % 16 == 0 {
+                total_merged += s.compact_tiers().unwrap().items_merged;
+            }
+        }
+        total_merged += s.compact_tiers().unwrap().items_merged;
+        let n = n as usize;
+        assert!(total_merged > 0, "compaction actually ran");
+        assert!(
+            total_merged < 20 * n,
+            "tiered merge work {total_merged} is ~O(N log N) (< 20*N = {}), not O(N^2={})",
+            20 * n,
+            n * n
+        );
+        assert_eq!(live_multiset(&s).len(), n, "no data lost");
+    }
+
     // ---- property-based: random op sequences vs a reference model ----
 
     use proptest::prelude::*;

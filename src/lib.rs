@@ -395,6 +395,40 @@ impl<S: Store> SegmentedStore<S> {
         Ok(())
     }
 
+    /// Add (or re-add) many items, syncing the WAL once for the whole batch
+    /// instead of per item. This is the bulk-ingest path (the build phase of an
+    /// index, e.g. lexir/sporse loading a corpus): per-item flush is the dominant
+    /// cost there, and one sync per batch is several times faster on a real disk.
+    ///
+    /// The durability boundary is the batch's final sync, so a crash mid-batch may
+    /// leave a *prefix* of the batch durable (each item is an independently
+    /// CRC-checked WAL record); recovery yields a consistent prefix, never a
+    /// half-written item. Auto-compaction (if enabled) still runs when a segment
+    /// seals during the batch.
+    pub fn extend(
+        &mut self,
+        items: impl IntoIterator<Item = (S::Id, S::Item)>,
+    ) -> PersistenceResult<()> {
+        let mut any = false;
+        for (id, item) in items {
+            self.wal
+                .append_postcard(&Op::Add(id.clone(), item.clone()))?;
+            apply(&mut self.buffer, &mut self.tombstones, Op::Add(id, item));
+            any = true;
+            if self.buffer.len() >= self.flush_threshold {
+                self.flush_buffer();
+                if self.auto_compact && self.has_eligible_tier() {
+                    self.sync_wal()?; // make the sealed batch durable before a merge rewrites it
+                    self.compact_tiers()?;
+                }
+            }
+        }
+        if any {
+            self.sync_wal()?;
+        }
+        Ok(())
+    }
+
     /// Tombstone an item. Durably logged before it takes effect.
     pub fn delete(&mut self, id: S::Id) -> PersistenceResult<()> {
         self.wal
@@ -1888,6 +1922,81 @@ mod tests {
             s.segment_count()
         );
         assert_eq!(live_multiset(&s).len(), 40, "without losing data");
+    }
+
+    // ---- bulk ingest (extend) + harder corruption ----
+
+    #[test]
+    fn extend_matches_individual_adds() {
+        let mut s1 = SegmentedStore::open(MemoryDirectory::arc(), Kv, 2).unwrap();
+        let mut s2 = SegmentedStore::open(MemoryDirectory::arc(), Kv, 2).unwrap();
+        for i in 0..20u32 {
+            s1.add(i, format!("v{i}")).unwrap();
+        }
+        s2.extend((0..20u32).map(|i| (i, format!("v{i}")))).unwrap();
+        assert_eq!(live_set(&s1), live_set(&s2), "extend == individual adds");
+        assert_eq!(s1.segment_count(), s2.segment_count());
+    }
+
+    #[test]
+    fn extend_is_durable_across_reopen() {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 4).unwrap();
+            s.extend((0..20u32).map(|i| (i, format!("v{i}")))).unwrap();
+        }
+        let s = SegmentedStore::open(dir, Kv, 4).unwrap();
+        assert_eq!(
+            live_set(&s).len(),
+            20,
+            "the whole batch is durable after sync"
+        );
+    }
+
+    #[test]
+    fn garbled_wal_record_is_caught_by_crc() {
+        // Harder than truncation: flip a byte inside a committed WAL record. Each
+        // record carries a CRC, so recovery detects the bad record and (BestEffort)
+        // stops there -- yielding a consistent PREFIX of the adds, never a panic or
+        // a decoded-garbage record. This also documents the interior-corruption
+        // behavior: records after the corruption are dropped (treated as a torn tail).
+        let root = temp_root("garble-wal");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 100).unwrap(); // all in one WAL
+            for i in 1..=6u32 {
+                s.add(i, format!("v{i}")).unwrap();
+            }
+        }
+        let wal = root.join(wal_path(0));
+        let mut bytes = std::fs::read(&wal).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF; // corrupt an interior record
+        std::fs::write(&wal, &bytes).unwrap();
+
+        // Recovery is SAFE either way: it returns a hard error (a corrupted length
+        // field is not a clean torn tail) OR a consistent contiguous prefix of the
+        // adds -- but NEVER a panic, a decoded-garbage id, or the corrupted record.
+        // (Which of the two depends on where in the record the byte landed; the
+        // safe-behavior invariant is what matters and is what we assert.)
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        match SegmentedStore::open(dir, Kv, 100) {
+            Ok(s2) => {
+                let mut live: Vec<u32> = live_set(&s2).into_iter().map(|(id, _)| id).collect();
+                live.sort_unstable();
+                assert!(
+                    live.len() < 6,
+                    "the corrupted record + tail are dropped: {live:?}"
+                );
+                assert_eq!(
+                    live,
+                    (1..=live.len() as u32).collect::<Vec<_>>(),
+                    "survivors are the contiguous prefix before the corruption: {live:?}"
+                );
+            }
+            Err(_) => { /* hard fault on corruption: acceptable, never garbage */ }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- property-based: random op sequences vs a reference model ----

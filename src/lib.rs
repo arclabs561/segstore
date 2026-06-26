@@ -442,8 +442,17 @@ impl<S: Store> SegmentedStore<S> {
                 .merge_segments(&self.segments, &|id| !tombstones.contains(id));
             stats.merges = 1;
             stats.items_merged = self.store.segment_len(&merged);
-            self.segments = vec![merged];
+            // Drop a fully-tombstoned merge result rather than keep an empty segment.
+            self.segments = if stats.items_merged > 0 {
+                vec![merged]
+            } else {
+                vec![]
+            };
         }
+        // After a full compaction no segment references a tombstoned id, so the set
+        // is purged even if there was nothing to merge (stale tombstones for ids that
+        // were only ever buffered).
+        self.tombstones.clear();
         self.checkpoint()?;
         stats.segments_after = self.segments.len();
         Ok(stats)
@@ -525,13 +534,16 @@ impl<S: Store> SegmentedStore<S> {
                 .merge_segments(&segs, &|id| !tombstones.contains(id))
         };
         let n = self.store.segment_len(&merged);
-        // Remove the merged segments (highest index first), then append the result.
+        // Remove the merged segments (highest index first), then append the result
+        // unless it is empty (a fully-tombstoned group leaves no segment behind).
         let mut desc = indices;
         desc.sort_unstable_by(|a, b| b.cmp(a));
         for i in desc {
             self.segments.remove(i);
         }
-        self.segments.push(merged);
+        if n > 0 {
+            self.segments.push(merged);
+        }
         n
     }
 
@@ -1461,6 +1473,49 @@ mod tests {
                 "fail_after={fail_after}: recovered set must be exactly the durably-acked adds"
             );
         }
+    }
+
+    #[test]
+    fn no_space_leak_across_crash_recovery_cycles() {
+        // After many crash+recover cycles, deleting everything and a full compaction
+        // returns the store to baseline: no leaked segments, items, tombstones, or WAL
+        // generations. This is redb's canonical invariant and the bug class targeted
+        // crash tests structurally miss (a slow leak across recovery cycles).
+        let mem = MemoryDirectory::arc();
+        for cycle in 0..20u32 {
+            // "Crash": run a few ops under an IO fault and drop the store mid-flight.
+            let dir = FaultDir::arc(mem.clone(), (cycle as usize % 5) + 1);
+            if let Ok(mut s) = SegmentedStore::open(dir, Kv, 2) {
+                for j in 0..4u32 {
+                    let id = cycle * 100 + j;
+                    let _ = s.add(id, format!("v{id}"));
+                    let _ = s.compact_tiers();
+                }
+            }
+            // Recover on the clean directory between cycles.
+            let _ = SegmentedStore::open(mem.clone(), Kv, 2).unwrap();
+        }
+        // Delete every surviving id, then full-compact.
+        let mut s = SegmentedStore::open(mem.clone(), Kv, 2).unwrap();
+        let live: Vec<u32> = live_set(&s).into_iter().map(|(id, _)| id).collect();
+        for id in live {
+            s.delete(id).unwrap();
+        }
+        s.compact().unwrap();
+        assert_eq!(
+            s.segment_count(),
+            0,
+            "no leaked segments after delete-all + compact"
+        );
+        assert_eq!(s.stored_len(), 0, "no leaked stored items");
+        assert_eq!(s.tombstone_count(), 0, "compact purged the tombstone set");
+        let wals: Vec<String> = mem
+            .list_dir("")
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.starts_with(WAL_PREFIX))
+            .collect();
+        assert!(wals.len() <= 1, "no leaked WAL generations: {wals:?}");
     }
     // ---- tombstone reclamation (optional live_len) ----
 

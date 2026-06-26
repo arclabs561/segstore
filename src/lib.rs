@@ -72,6 +72,15 @@
 //! is a visibility boundary (userspace -> OS), while [`SyncPolicy::Fsync`] syncs
 //! every record to stable storage (filesystem backend only).
 //!
+//! Recovery is *point-in-time*: the WAL is read best-effort, so a torn final record
+//! (the expected damage from a crash mid-write) is truncated and the consistent
+//! prefix recovered. This is the same default as RocksDB's `kPointInTimeRecovery`.
+//! It does NOT detect corruption *beyond* the torn tail (a bit-flip of an
+//! already-committed interior record): each record is CRC-checked, so such a record
+//! is never decoded as garbage, but best-effort read stops at it and drops the rest.
+//! Media-rot detection (a strict "fail on any corruption" mode) is out of scope for
+//! this crash-consistency WAL; a consumer needing it should use checksummed storage.
+//!
 //! On-disk format note: segstore 0.2 changed the WAL layout (epoch-suffixed
 //! files, with the epoch recorded in the checkpoint) from 0.1's single
 //! unsuffixed `segstore.wal`. A 0.1 store is detected and rejected with a clear

@@ -1455,9 +1455,10 @@ mod tests {
         }
         assert_eq!(s.segment_count(), 10);
         let stats = s.force_merge_to(3).unwrap();
-        // Minimum work: consolidates to exactly 3 (not fewer), like Lucene forceMerge.
+        // Minimum work: consolidates to exactly 3 in a single merge (k = over+1 = 8
+        // segments at once), like Lucene's least-number-of-merges force-merge.
         assert_eq!(s.segment_count(), 3, "consolidated to exactly 3");
-        assert!(stats.merges > 0);
+        assert_eq!(stats.merges, 1, "one merge suffices (minimum work)");
         assert!(stats.items_merged > 0, "merged work is reported");
         assert_eq!(live_multiset(&s).len(), 20, "no data lost");
     }

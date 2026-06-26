@@ -47,8 +47,11 @@ assert!(s.is_live(&1) && !s.is_live(&2));
 v0. In-memory and on-disk via `durability`, with crash recovery by replaying the
 write-ahead log past the last checkpoint. Known v0 limitations: the WAL is not
 yet rotated (it grows until a fresh checkpoint re-bases it), and writes flush but
-do not `fsync` per operation. Built to back the updatable-index work across the
-retrieval crates.
+do not `fsync` per operation.
+
+Not to be confused with `seglog`, an append-only *event log* for event sourcing:
+segstore is a mutable index-backing store with deletes and compaction, the layer
+*above* a write-ahead log rather than the log itself.
 
 ## License
 

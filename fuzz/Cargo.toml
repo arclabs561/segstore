@@ -1,0 +1,25 @@
+[package]
+name = "segstore-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+segstore = { path = ".." }
+durability = "0.6"
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "ops"
+path = "fuzz_targets/ops.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace so the parent crate's build/CI never pulls in the fuzz target
+# (it needs nightly + the libFuzzer sanitizer runtime).
+[workspace]

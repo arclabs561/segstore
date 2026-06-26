@@ -1521,6 +1521,178 @@ mod tests {
         assert_eq!(live_multiset(&s).len(), n, "no data lost");
     }
 
+    // ---- mutation-driven: pin behavior the live-set tests left unobserved ----
+
+    #[test]
+    fn epoch_advances_per_checkpoint() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(s.epoch(), 0);
+        s.add(1, "a".into()).unwrap();
+        s.checkpoint().unwrap();
+        assert_eq!(s.epoch(), 1);
+        s.checkpoint().unwrap();
+        assert_eq!(s.epoch(), 2);
+    }
+
+    #[test]
+    fn stored_len_and_space_amp_count_the_buffer() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 100).unwrap(); // stays buffered
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "b".into()).unwrap();
+        assert_eq!(s.segment_count(), 0, "all buffered");
+        assert_eq!(s.stored_len(), 2, "stored_len counts the buffer");
+        assert_eq!(
+            s.space_amplification(),
+            Some(1.0),
+            "buffered items are live"
+        );
+    }
+
+    #[test]
+    fn space_amp_of_empty_store_is_one() {
+        let dir = MemoryDirectory::arc();
+        let s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(s.space_amplification(), Some(1.0));
+    }
+
+    #[test]
+    fn space_amp_is_infinite_when_all_dead() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "b".into()).unwrap(); // 1 segment, size 2
+        s.delete(1).unwrap();
+        s.delete(2).unwrap(); // stored 2, live 0
+        assert!(
+            s.space_amplification().unwrap().is_infinite(),
+            "an all-dead segment is infinite amplification"
+        );
+    }
+
+    #[test]
+    fn has_eligible_tier_is_true_when_a_bucket_is_full() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig {
+            min_merge: 4,
+            ..Default::default()
+        };
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(2, cfg, false)).unwrap();
+        for i in 0..8u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 4 size-2 segments = one full bucket
+        }
+        assert!(s.has_eligible_tier());
+    }
+
+    #[test]
+    fn compact_merges_only_when_there_is_work() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "b".into()).unwrap(); // 1 segment, no tombstones
+        assert_eq!(
+            s.compact().unwrap().merges,
+            0,
+            "a single clean segment: nothing to merge"
+        );
+        s.delete(1).unwrap();
+        assert_eq!(
+            s.compact().unwrap().merges,
+            1,
+            "a tombstone present: merge to purge it"
+        );
+    }
+
+    #[test]
+    fn reclaim_respects_the_live_ratio_threshold() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 4).unwrap();
+        for i in 0..12u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 3 segments: [0-3] [4-7] [8-11]
+        }
+        // A: delete 0,1,2 -> 1/4 = 0.25 live. B: delete 4 -> 3/4 = 0.75. C: delete 8,9 -> 2/4 = 0.5.
+        for i in [0u32, 1, 2, 4, 8, 9] {
+            s.delete(i).unwrap();
+        }
+        let stats = s.reclaim_tombstones(0.5).unwrap();
+        // Only A (0.25 < 0.5) qualifies; C (0.5) is at the threshold, not below; B (0.75) is above.
+        assert_eq!(
+            stats.merges, 1,
+            "only the sub-threshold segment is reclaimed"
+        );
+        assert_eq!(
+            s.segment_count(),
+            3,
+            "A rewritten in place; B and C untouched"
+        );
+        assert_eq!(s.stored_len(), 1 + 4 + 4, "only A's dead entries dropped");
+    }
+
+    #[test]
+    fn compact_tiers_persists_across_reopen() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig {
+            min_merge: 4,
+            ..Default::default()
+        };
+        {
+            let mut s =
+                SegmentedStore::open_with_options(dir.clone(), Kv, tier_opts(2, cfg, false))
+                    .unwrap();
+            for i in 0..8u32 {
+                s.add(i, format!("v{i}")).unwrap();
+            }
+            assert_eq!(s.compact_tiers().unwrap().merges, 1);
+            assert_eq!(s.segment_count(), 1);
+        }
+        let s = SegmentedStore::open_with_options(dir, Kv, tier_opts(2, cfg, false)).unwrap();
+        assert_eq!(s.segment_count(), 1, "the tier merge was checkpointed");
+        assert_eq!(live_multiset(&s).len(), 8);
+    }
+
+    #[test]
+    fn compact_tiers_without_eligible_bucket_does_not_checkpoint() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 100).unwrap();
+        s.add(1, "a".into()).unwrap();
+        let e = s.epoch();
+        assert_eq!(s.compact_tiers().unwrap().merges, 0);
+        assert_eq!(s.epoch(), e, "no merge -> no checkpoint -> epoch unchanged");
+    }
+
+    // ---- research failure modes: the cap is the O(N^2) write-amp preventer ----
+
+    #[test]
+    fn cap_freezes_large_segments_from_tier_merges() {
+        let dir = MemoryDirectory::arc();
+        // cap = 8 -> a segment above cap/2 = 4 is frozen out of tier merges, so the
+        // biggest segment is never rewritten by tiering (the O(N^2) cliff guard).
+        let cfg = TierConfig {
+            min_merge: 4,
+            max_merged_len: 8,
+            ..Default::default()
+        };
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(2, cfg, false)).unwrap();
+        for i in 0..8u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        s.force_merge_to(1).unwrap(); // one size-8 segment, now frozen (> cap/2)
+        assert_eq!(s.segment_sizes(), vec![8]);
+        for i in 8..20u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 6 more size-2 segments
+        }
+        s.compact_tiers().unwrap();
+        assert!(
+            s.segment_sizes().contains(&8),
+            "the frozen segment is never selected for a tier merge"
+        );
+        for sz in s.segment_sizes() {
+            assert!(sz <= cfg.max_merged_len, "no segment exceeds the cap");
+        }
+        assert_eq!(live_multiset(&s).len(), 20, "no data lost");
+    }
+
     // ---- property-based: random op sequences vs a reference model ----
 
     use proptest::prelude::*;
@@ -1549,6 +1721,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
         /// For any sequence of add/delete/compact/compact_tiers/reopen, the live set
         /// equals the reference model and every segment stays within the cap.
         #[test]

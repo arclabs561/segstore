@@ -32,6 +32,7 @@ impl Store for Kv {
     ) -> Vec<(u32, String)> {
         segs.iter().flatten().filter(|(id, _)| live(id)).cloned().collect()
     }
+    fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize { seg.len() }
 }
 
 let dir = MemoryDirectory::arc();
@@ -42,12 +43,32 @@ s.delete(2).unwrap();
 assert!(s.is_live(&1) && !s.is_live(&2));
 ```
 
+## Durability
+
+In-memory or on-disk via `durability`. Each `add`/`delete` is logged to a
+write-ahead log before it takes effect; a checkpoint snapshots the segments and
+tombstones and publishes atomically (CRC-checked, with an fsync barrier on a
+filesystem backend). The WAL is rotated per checkpoint (a new epoch-suffixed log
+is started and the old one deleted), so the log never grows past one checkpoint
+interval, and recovery replays only the current epoch's WAL. `SyncPolicy::Fsync`
+(via `open_with_options`) syncs every WAL record to stable storage; the default
+flushes to the OS without a per-op fsync.
+
+## Compaction
+
+`compact()` merges all segments into one and purges tombstones.
+`compact_tiers()` runs size-tiered compaction (Cassandra/Lucene-style): segments
+are grouped into size buckets and a full bucket is merged, smallest first, never
+exceeding `max_merged_len` items, with larger segments frozen out so the biggest
+one is never rewritten by tiering. Scheduling is the consumer's: call
+`compact_tiers()` when convenient (e.g. a background thread), or set
+`Options::auto_compact` to run it inline after a flush. `segment_sizes()` and the
+`CompactionStats` returned by both expose the segment-count and merge-cost signal
+to watch as the corpus grows.
+
 ## Status
 
-v0. In-memory and on-disk via `durability`, with crash recovery by replaying the
-write-ahead log past the last checkpoint. Known v0 limitations: the WAL is not
-yet rotated (it grows until a fresh checkpoint re-bases it), and writes flush but
-do not `fsync` per operation.
+0.x; the API and on-disk format may change between minor versions.
 
 Not to be confused with `seglog`, an append-only *event log* for event sourcing:
 segstore is a mutable index-backing store with deletes and compaction, the layer

@@ -224,6 +224,20 @@ pub trait Store {
     /// tombstone drop a merge applied) is the right answer. For the common
     /// `Vec`-backed segment this is just `segment.len()`.
     fn segment_len(&self, segment: &Self::Segment) -> usize;
+
+    /// The number of items in `segment` for which `live` is true (i.e. excluding
+    /// tombstoned ids), if the consumer can compute it cheaply. Returning `Some`
+    /// enables space-amplification reporting ([`SegmentedStore::space_amplification`])
+    /// and tombstone-reclaiming compaction ([`SegmentedStore::reclaim_tombstones`]).
+    /// The default `None` disables both; the size-tiered path does not need it.
+    /// For a `Vec`-backed segment: `Some(segment.iter().filter(|(id, _)| live(id)).count())`.
+    fn live_len(
+        &self,
+        _segment: &Self::Segment,
+        _live: &dyn Fn(&Self::Id) -> bool,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 /// One write-ahead-log operation.
@@ -609,6 +623,77 @@ impl<S: Store> SegmentedStore<S> {
         self.epoch
     }
 
+    /// Space amplification = stored items / live items, or `None` if any segment's
+    /// [`Store::live_len`] returns `None` (the default). A value near 1.0 means
+    /// little dead data; a higher value means tombstoned/obsolete items are
+    /// accumulating, reclaimable with [`Self::reclaim_tombstones`] or [`Self::compact`].
+    pub fn space_amplification(&self) -> Option<f64> {
+        let mut stored = 0usize;
+        let mut live = 0usize;
+        for seg in &self.segments {
+            let l = self
+                .store
+                .live_len(seg, &|id| !self.tombstones.contains(id))?;
+            stored += self.store.segment_len(seg);
+            live += l;
+        }
+        // Buffer items are always live (a delete removes from the buffer).
+        stored += self.buffer.len();
+        live += self.buffer.len();
+        if live == 0 {
+            return Some(if stored == 0 { 1.0 } else { f64::INFINITY });
+        }
+        Some(stored as f64 / live as f64)
+    }
+
+    /// Merge segments whose live ratio (`live_len / segment_len`) is below
+    /// `min_live_ratio`, reclaiming their dead (tombstoned) entries into one fresh
+    /// segment. The cheap alternative to [`Self::compact`] when only a few segments
+    /// are tombstone-heavy. Requires [`Store::live_len`]; a no-op if it returns
+    /// `None` or nothing qualifies. Keeps the tombstone set (a reclaimed id may
+    /// still live in a segment this did not touch); only `compact` purges it.
+    pub fn reclaim_tombstones(
+        &mut self,
+        min_live_ratio: f64,
+    ) -> PersistenceResult<CompactionStats> {
+        self.flush_buffer();
+        let mut stats = CompactionStats {
+            segments_before: self.segments.len(),
+            ..Default::default()
+        };
+        let mut targets = Vec::new();
+        for (i, seg) in self.segments.iter().enumerate() {
+            let total = self.store.segment_len(seg);
+            if total == 0 {
+                continue;
+            }
+            let live = match self
+                .store
+                .live_len(seg, &|id| !self.tombstones.contains(id))
+            {
+                Some(l) => l,
+                None => {
+                    // Consumer can't report live counts; reclaim is unavailable.
+                    stats.segments_after = self.segments.len();
+                    return Ok(stats);
+                }
+            };
+            if (live as f64) < min_live_ratio * total as f64 {
+                targets.push(i);
+            }
+        }
+        if targets.is_empty() {
+            stats.segments_after = self.segments.len();
+            return Ok(stats);
+        }
+        // Even a single tombstone-heavy segment is worth rewriting to drop dead data.
+        stats.items_merged += self.merge_group(targets);
+        stats.merges = 1;
+        self.checkpoint()?;
+        stats.segments_after = self.segments.len();
+        Ok(stats)
+    }
+
     /// Per-segment item counts, oldest segment first. The size distribution the
     /// consumer needs to watch the crossover signal (segment count + per-query
     /// fan-out vs corpus size) that says a multi-segment store is outgrowing the
@@ -707,6 +792,34 @@ mod tests {
 
     struct Kv;
     impl Store for Kv {
+        type Id = u32;
+        type Item = String;
+        type Segment = Vec<(u32, String)>;
+        fn build_segment(&self, batch: &[(u32, String)]) -> Vec<(u32, String)> {
+            batch.to_vec()
+        }
+        fn merge_segments(
+            &self,
+            segs: &[Vec<(u32, String)>],
+            live: &dyn Fn(&u32) -> bool,
+        ) -> Vec<(u32, String)> {
+            segs.iter()
+                .flatten()
+                .filter(|(id, _)| live(id))
+                .cloned()
+                .collect()
+        }
+        fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize {
+            seg.len()
+        }
+        fn live_len(&self, seg: &Vec<(u32, String)>, live: &dyn Fn(&u32) -> bool) -> Option<usize> {
+            Some(seg.iter().filter(|(id, _)| live(id)).count())
+        }
+    }
+
+    /// A store that does NOT implement `live_len` (uses the default `None`).
+    struct OpaqueKv;
+    impl Store for OpaqueKv {
         type Id = u32;
         type Item = String;
         type Segment = Vec<(u32, String)>;
@@ -1254,6 +1367,83 @@ mod tests {
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (2, "b".into())]);
         let _ = std::fs::remove_dir_all(&root);
     }
+    // ---- tombstone reclamation (optional live_len) ----
+
+    #[test]
+    fn space_amplification_tracks_dead_data() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..10u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        assert_eq!(
+            s.space_amplification(),
+            Some(1.0),
+            "no deletes, no dead data"
+        );
+        for i in 0..5u32 {
+            s.delete(i).unwrap();
+        }
+        // 10 stored, 5 live -> amplification 2.0.
+        assert_eq!(s.space_amplification(), Some(2.0));
+        s.compact().unwrap();
+        assert_eq!(s.space_amplification(), Some(1.0), "compaction reclaims it");
+    }
+
+    #[test]
+    fn space_amplification_is_none_without_live_len() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, OpaqueKv, 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "b".into()).unwrap();
+        assert_eq!(
+            s.space_amplification(),
+            None,
+            "a store without live_len cannot report it"
+        );
+    }
+
+    #[test]
+    fn reclaim_tombstones_rewrites_only_heavy_segments() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        // 5 segments of size 2 (ids 0..10).
+        for i in 0..10u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        // Tombstone both items in the first two segments (ids 0,1,2,3) -> those
+        // segments are fully dead; the rest are fully live.
+        for i in 0..4u32 {
+            s.delete(i).unwrap();
+        }
+        let before_stored = s.stored_len();
+        let stats = s.reclaim_tombstones(0.5).unwrap();
+        assert!(stats.merges > 0, "the dead segments were reclaimed");
+        assert!(
+            s.stored_len() < before_stored,
+            "dead data dropped: {} < {}",
+            s.stored_len(),
+            before_stored
+        );
+        // Live set unchanged; tombstones kept (no full purge).
+        let live: Vec<u32> = live_set(&s).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(live, (4..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reclaim_tombstones_is_noop_without_live_len() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, OpaqueKv, 2).unwrap();
+        for i in 0..6u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        s.delete(0).unwrap();
+        let before = s.segment_count();
+        let stats = s.reclaim_tombstones(0.9).unwrap();
+        assert_eq!(stats.merges, 0, "no live_len -> reclaim is a no-op");
+        assert_eq!(s.segment_count(), before);
+    }
+
     // ---- force-merge / on-demand consolidation ----
 
     #[test]

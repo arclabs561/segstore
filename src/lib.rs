@@ -1710,6 +1710,30 @@ mod tests {
         assert_eq!(live_multiset(&s).len(), 20, "no data lost");
     }
 
+    #[test]
+    fn without_compaction_fan_out_grows_then_collapses() {
+        // The failure mode tiering exists to prevent: with no compaction every
+        // flush adds a segment, and a query scans all segments, so fan-out grows
+        // linearly with the corpus. Compaction collapses it.
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..40u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        assert_eq!(
+            s.segment_count(),
+            20,
+            "no compaction: 40 adds / flush 2 = 20 segments to scan per query"
+        );
+        s.compact_tiers().unwrap();
+        assert!(
+            s.segment_count() < 20,
+            "tiered compaction collapses the fan-out, got {}",
+            s.segment_count()
+        );
+        assert_eq!(live_multiset(&s).len(), 40, "without losing data");
+    }
+
     // ---- property-based: random op sequences vs a reference model ----
 
     use proptest::prelude::*;

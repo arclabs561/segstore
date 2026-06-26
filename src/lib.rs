@@ -406,4 +406,71 @@ mod tests {
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (3, "c".into())]);
         assert!(!s2.is_live(&2));
     }
+
+    /// A unique scratch directory under the OS temp dir (no tempfile dep).
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("segstore-test-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn recovers_on_real_disk_via_fs_directory() {
+        let root = temp_root("fs-recover");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap(); // flushes a segment
+            s.checkpoint().unwrap();
+            s.add(3, "c".into()).unwrap(); // post-checkpoint, WAL only
+            s.delete(2).unwrap();
+        } // process-style drop: nothing in memory, only the on-disk WAL + checkpoint
+
+        // A fresh FsDirectory on the same root must reconstruct the live set.
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let s2 = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(live_set(&s2), vec![(1, "a".into()), (3, "c".into())]);
+        assert!(!s2.is_live(&2));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn torn_wal_tail_is_dropped_not_fatal() {
+        let root = temp_root("torn-wal");
+        // Threshold high enough that every op stays in the WAL (no checkpoint,
+        // no segment files), so the WAL is the single source of truth.
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 100).unwrap();
+            s.add(1, "aaaa".into()).unwrap();
+            s.add(2, "bbbb".into()).unwrap();
+            s.add(3, "cccc".into()).unwrap();
+            s.add(4, "dddd".into()).unwrap(); // this record's tail gets corrupted
+        }
+
+        // Corrupt the final WAL record by chopping bytes off the end of the file.
+        // postcard records are length-prefixed, so a truncated final payload makes
+        // the BestEffort reader stop before it rather than decode garbage.
+        let wal = root.join(WAL_PATH);
+        let bytes = std::fs::read(&wal).unwrap();
+        assert!(bytes.len() > 3, "WAL should hold four records");
+        std::fs::write(&wal, &bytes[..bytes.len() - 3]).unwrap();
+
+        // Recovery must succeed (no panic, no Err) and recover the intact prefix.
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let s2 = SegmentedStore::open(dir, Kv, 100).unwrap();
+        // id 4 never made it into the store: the torn final record was dropped,
+        // so the live set is exactly the intact prefix. (`is_live` only reports
+        // tombstone state, so it is not the right probe for "never added".)
+        assert_eq!(
+            live_set(&s2),
+            vec![(1, "aaaa".into()), (2, "bbbb".into()), (3, "cccc".into())],
+            "the torn final record is dropped; the prefix survives"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

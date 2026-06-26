@@ -255,6 +255,70 @@ struct Snapshot<Id, Seg> {
     tombstones: Vec<Id>,
 }
 
+/// The reader-visible published state: the segments and tombstones as of the last
+/// mutation, behind `Arc`s so a [`View`] is a cheap, consistent snapshot.
+struct PubState<S: Store> {
+    segments: Arc<Vec<Arc<S::Segment>>>,
+    tombstones: Arc<HashSet<S::Id>>,
+}
+
+/// A consistent, point-in-time read view of the store, independent of the writer.
+///
+/// A [`Reader`] hands these out; holding one keeps its segments alive for the whole
+/// query even as the writer adds, deletes, or compacts concurrently (single-writer,
+/// many-readers, like Lucene's `SearcherManager` / Tantivy's `Searcher`). The view
+/// reflects state as of the last *sealed* segment + tombstones; adds still buffered
+/// in the writer become visible after the next flush.
+pub struct View<S: Store> {
+    segments: Arc<Vec<Arc<S::Segment>>>,
+    tombstones: Arc<HashSet<S::Id>>,
+}
+
+impl<S: Store> View<S> {
+    /// The snapshot's immutable segments, oldest first. Query these (each derefs to
+    /// `S::Segment`), filtering with [`Self::is_live`].
+    pub fn segments(&self) -> &[Arc<S::Segment>] {
+        &self.segments
+    }
+
+    /// Whether `id` is not tombstoned in this snapshot.
+    pub fn is_live(&self, id: &S::Id) -> bool {
+        !self.tombstones.contains(id)
+    }
+
+    /// Number of segments in this snapshot.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+/// A cloneable, thread-safe handle for concurrent snapshot reads while the writer
+/// mutates. Obtain via [`SegmentedStore::reader`]; clone freely across threads.
+pub struct Reader<S: Store> {
+    published: Arc<std::sync::RwLock<Arc<PubState<S>>>>,
+}
+
+impl<S: Store> Clone for Reader<S> {
+    fn clone(&self) -> Self {
+        Reader {
+            published: self.published.clone(),
+        }
+    }
+}
+
+impl<S: Store> Reader<S> {
+    /// Take a consistent [`View`] of the store as of the last published mutation.
+    /// Cheap (a couple of `Arc` clones under a brief read lock); the view is then
+    /// held lock-free for the query's duration.
+    pub fn view(&self) -> View<S> {
+        let state = self.published.read().unwrap().clone();
+        View {
+            segments: state.segments.clone(),
+            tombstones: state.tombstones.clone(),
+        }
+    }
+}
+
 /// A generic, durable, segmented mutable store.
 pub struct SegmentedStore<S: Store> {
     store: S,
@@ -265,6 +329,8 @@ pub struct SegmentedStore<S: Store> {
     segments: Vec<S::Segment>,
     /// Logically-deleted ids.
     tombstones: HashSet<S::Id>,
+    /// Published snapshot for concurrent readers (rebuilt on each mutation).
+    published: Arc<std::sync::RwLock<Arc<PubState<S>>>>,
     wal: RecordLogWriter,
     /// Current WAL generation; the live WAL is `segstore.wal.<epoch>` and the
     /// checkpoint records the epoch it covers.
@@ -365,6 +431,10 @@ impl<S: Store> SegmentedStore<S> {
         }
 
         let wal = RecordLogWriter::new(dir.clone(), live_wal);
+        let published = Arc::new(std::sync::RwLock::new(Arc::new(PubState {
+            segments: Arc::new(segments.iter().map(|s| Arc::new(s.clone())).collect()),
+            tombstones: Arc::new(tombstones.clone()),
+        })));
         Ok(Self {
             store,
             dir,
@@ -377,7 +447,31 @@ impl<S: Store> SegmentedStore<S> {
             flush_threshold,
             tiering,
             auto_compact,
+            published,
         })
+    }
+
+    /// A cloneable handle for concurrent snapshot reads while this writer mutates.
+    /// Clone it across threads; each [`Reader::view`] is a consistent snapshot.
+    pub fn reader(&self) -> Reader<S> {
+        Reader {
+            published: self.published.clone(),
+        }
+    }
+
+    /// Rebuild the published snapshot from the current segments + tombstones. Called
+    /// after any mutation that changes what a reader should see (a sealed segment, a
+    /// delete, a compaction). v1 clones the segment data into the new published view;
+    /// holding segments as `Arc` internally to make this a refcount-only publish is a
+    /// future optimization if publish cost shows up under profiling.
+    fn republish(&self) {
+        let segments: Vec<Arc<S::Segment>> =
+            self.segments.iter().map(|s| Arc::new(s.clone())).collect();
+        let state = Arc::new(PubState {
+            segments: Arc::new(segments),
+            tombstones: Arc::new(self.tombstones.clone()),
+        });
+        *self.published.write().unwrap() = state;
     }
 
     /// Add (or re-add) an item. Durably logged before it becomes visible.
@@ -435,6 +529,7 @@ impl<S: Store> SegmentedStore<S> {
             .append_postcard::<Op<S::Id, S::Item>>(&Op::Delete(id.clone()))?;
         self.sync_wal()?;
         apply(&mut self.buffer, &mut self.tombstones, Op::Delete(id));
+        self.republish();
         Ok(())
     }
 
@@ -454,6 +549,7 @@ impl<S: Store> SegmentedStore<S> {
         let seg = self.store.build_segment(&self.buffer);
         self.segments.push(seg);
         self.buffer.clear();
+        self.republish();
     }
 
     /// Merge ALL segments into one, dropping tombstoned ids and purging the
@@ -786,6 +882,8 @@ impl<S: Store> SegmentedStore<S> {
         self.wal = RecordLogWriter::new(self.dir.clone(), wal_path(new_epoch));
         self.epoch = new_epoch;
         let _ = self.dir.delete(&wal_path(old_epoch));
+        // Publish the post-compaction segment set to readers (the commit point).
+        self.republish();
         Ok(())
     }
 
@@ -1922,6 +2020,119 @@ mod tests {
             s.segment_count()
         );
         assert_eq!(live_multiset(&s).len(), 40, "without losing data");
+    }
+
+    // ---- concurrent snapshot reads ----
+
+    #[test]
+    fn view_reflects_segments_minus_tombstones() {
+        let mut s = SegmentedStore::open(MemoryDirectory::arc(), Kv, 2).unwrap();
+        for i in 0..6u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        s.delete(2).unwrap();
+        let v = s.reader().view();
+        let mut live: Vec<u32> = Vec::new();
+        for seg in v.segments() {
+            for (id, _) in seg.iter() {
+                if v.is_live(id) {
+                    live.push(*id);
+                }
+            }
+        }
+        live.sort_unstable();
+        assert_eq!(
+            live,
+            vec![0, 1, 3, 4, 5],
+            "view = sealed segments minus tombstones"
+        );
+    }
+
+    #[test]
+    fn view_is_a_stable_snapshot_across_writes() {
+        let mut s = SegmentedStore::open(MemoryDirectory::arc(), Kv, 2).unwrap();
+        for i in 0..6u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 3 segments
+        }
+        let reader = s.reader();
+        let v1 = reader.view();
+        let before = v1.segment_count();
+        assert_eq!(before, 3);
+        // Mutate heavily while v1 is held.
+        for i in 6..30u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        s.compact().unwrap();
+        assert_eq!(v1.segment_count(), before, "the held view never changes");
+        assert_eq!(
+            reader.view().segment_count(),
+            1,
+            "a fresh view sees the compacted state"
+        );
+    }
+
+    #[test]
+    fn concurrent_reader_during_writes_stays_consistent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut s = SegmentedStore::open_with_options(
+            MemoryDirectory::arc(),
+            Kv,
+            Options {
+                tiering: TierConfig {
+                    min_merge: 4,
+                    ..Default::default()
+                },
+                ..Options::new(4)
+            },
+        )
+        .unwrap();
+        for i in 0..40u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        let reader = s.reader();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        // Reader thread: take views and fully scan them while the writer mutates.
+        // Each view is an internally-consistent snapshot, so scanning never panics
+        // and never sees a torn segment list.
+        let handle = std::thread::spawn(move || {
+            let mut iters = 0u64;
+            while !stop2.load(Ordering::Relaxed) {
+                let v = reader.view();
+                let mut count = 0usize;
+                for seg in v.segments() {
+                    for (id, _) in seg.iter() {
+                        if v.is_live(id) {
+                            count += 1;
+                        }
+                    }
+                }
+                std::hint::black_box(count);
+                iters += 1;
+            }
+            iters
+        });
+        // Writer: add + compact concurrently with the reader.
+        for i in 40..400u32 {
+            s.add(i, format!("v{i}")).unwrap();
+            if i % 20 == 0 {
+                s.compact_tiers().unwrap();
+            }
+        }
+        s.compact().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        // Final snapshot sees every live item.
+        let v = s.reader().view();
+        let mut live = 0usize;
+        for seg in v.segments() {
+            for (id, _) in seg.iter() {
+                if v.is_live(id) {
+                    live += 1;
+                }
+            }
+        }
+        assert_eq!(live, 400, "all 400 items live after the concurrent run");
     }
 
     // ---- bulk ingest (extend) + harder corruption ----

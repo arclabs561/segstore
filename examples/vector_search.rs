@@ -47,6 +47,10 @@ impl Store for VectorIndex {
             .cloned()
             .collect()
     }
+
+    fn segment_len(&self, seg: &Vec<(u32, Vec<f32>)>) -> usize {
+        seg.len()
+    }
 }
 
 fn dist2(a: &[f32], b: &[f32]) -> f32 {

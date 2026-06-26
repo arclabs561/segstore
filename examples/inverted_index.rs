@@ -64,6 +64,15 @@ impl Store for InvertedIndex {
         out.retain(|_, ids| !ids.is_empty());
         out
     }
+
+    fn segment_len(&self, seg: &BTreeMap<String, Vec<u32>>) -> usize {
+        // The size metric is distinct documents (the unit of `Item`), not terms.
+        let mut docs = std::collections::HashSet::new();
+        for ids in seg.values() {
+            docs.extend(ids.iter().copied());
+        }
+        docs.len()
+    }
 }
 
 /// Retrieve the live document ids for `term` across segments + the live buffer.

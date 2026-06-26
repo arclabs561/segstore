@@ -46,6 +46,7 @@
 //!     ) -> Vec<(u32, String)> {
 //!         segs.iter().flatten().filter(|(id, _)| live(id)).cloned().collect()
 //!     }
+//!     fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize { seg.len() }
 //! }
 //!
 //! let dir = MemoryDirectory::arc();
@@ -76,6 +77,7 @@
 //! unsuffixed `segstore.wal`. A 0.1 store is detected and rejected with a clear
 //! error rather than misread.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -106,8 +108,90 @@ pub enum SyncPolicy {
     Flush,
     /// fsync each record to stable storage. Stronger (survives power loss) and
     /// slower; requires a filesystem-backed [`Directory`] (one that provides
-    /// `file_path()`), else [`SegmentedStore::open_with_sync`] errors.
+    /// `file_path()`), else [`SegmentedStore::open_with_options`] errors.
     Fsync,
+}
+
+/// Size-tiered compaction tuning. Defaults follow Cassandra's SizeTieredCompactionStrategy
+/// (`min_threshold = 4`, `max_threshold = 32`, bucket band `0.5x .. 1.5x`) and Lucene's
+/// `TieredMergePolicy` (a max merged-segment cap, above half of which a segment is frozen
+/// out of further tier merges).
+///
+/// The size metric is item count ([`Store::segment_len`]); these are item counts, not
+/// bytes. Because a query scans every segment, the per-tier segment count is paid on every
+/// read, so `min_merge` is kept small.
+#[derive(Debug, Clone, Copy)]
+pub struct TierConfig {
+    /// Minimum segments in a size bucket before it is eligible to merge (Cassandra
+    /// `min_threshold`). 2 degenerates tiering into leveling, so 4 is the practical floor.
+    pub min_merge: usize,
+    /// Maximum segments merged in one job (Cassandra `max_threshold`), bounding per-merge
+    /// cost and pause.
+    pub max_merge: usize,
+    /// Lower size-band multiplier for bucket membership (Cassandra `bucket_low`).
+    pub bucket_low: f64,
+    /// Upper size-band multiplier for bucket membership (Cassandra `bucket_high`).
+    pub bucket_high: f64,
+    /// Cap on a merged segment's item count. A segment larger than half of this is frozen
+    /// out of tier merges (Lucene's rule), so the largest segment is never rewritten by
+    /// tiering, only by a full [`SegmentedStore::compact`]. Without this, top-tier merges
+    /// rewrite the whole dataset (O(N^2) write amplification).
+    pub max_merged_len: usize,
+}
+
+impl Default for TierConfig {
+    fn default() -> Self {
+        Self {
+            min_merge: 4,
+            max_merge: 32,
+            bucket_low: 0.5,
+            bucket_high: 1.5,
+            max_merged_len: 10_000_000,
+        }
+    }
+}
+
+/// What a compaction did, for the consumer to track merge cost vs corpus size (the signal
+/// that a multi-segment store is outgrowing the search-all-segments model).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionStats {
+    /// Number of merge operations performed.
+    pub merges: usize,
+    /// Segment count before the compaction.
+    pub segments_before: usize,
+    /// Segment count after the compaction.
+    pub segments_after: usize,
+    /// Total items written into the merged output segment(s).
+    pub items_merged: usize,
+}
+
+/// Options for opening a [`SegmentedStore`].
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    /// Buffered-add count that seals a new segment.
+    pub flush_threshold: usize,
+    /// Per-write WAL durability.
+    pub sync: SyncPolicy,
+    /// Size-tiered compaction tuning (used by [`SegmentedStore::compact_tiers`]).
+    pub tiering: TierConfig,
+    /// When true, [`SegmentedStore::add`] runs `compact_tiers` after sealing a segment if a
+    /// bucket is eligible, on the calling thread. Default false: the consumer drives
+    /// `compact_tiers` when convenient (e.g. on a background thread), so the merge latency
+    /// never lands on the ingest hot path.
+    pub auto_compact: bool,
+}
+
+impl Options {
+    /// Options with the given flush threshold and defaults for the rest (`Flush` sync,
+    /// default tiering, no auto-compaction).
+    pub fn new(flush_threshold: usize) -> Self {
+        Self {
+            flush_threshold,
+            sync: SyncPolicy::Flush,
+            tiering: TierConfig::default(),
+            auto_compact: false,
+        }
+    }
 }
 
 /// The consumer-defined payload model: how items batch into a segment and how
@@ -134,6 +218,12 @@ pub trait Store {
         segments: &[Self::Segment],
         live: &dyn Fn(&Self::Id) -> bool,
     ) -> Self::Segment;
+
+    /// The number of items in `segment`. This is the size metric size-tiered
+    /// compaction groups segments by, so a count of *live* items (after any
+    /// tombstone drop a merge applied) is the right answer. For the common
+    /// `Vec`-backed segment this is just `segment.len()`.
+    fn segment_len(&self, segment: &Self::Segment) -> usize;
 }
 
 /// One write-ahead-log operation.
@@ -169,6 +259,10 @@ pub struct SegmentedStore<S: Store> {
     sync: SyncPolicy,
     /// Buffer size that triggers a flush into a new segment.
     flush_threshold: usize,
+    /// Size-tiered compaction tuning.
+    tiering: TierConfig,
+    /// Whether `add` auto-runs `compact_tiers` when a bucket is eligible.
+    auto_compact: bool,
 }
 
 impl<S: Store> SegmentedStore<S> {
@@ -181,20 +275,26 @@ impl<S: Store> SegmentedStore<S> {
         store: S,
         flush_threshold: usize,
     ) -> PersistenceResult<Self> {
-        Self::open_with_sync(dir, store, flush_threshold, SyncPolicy::Flush)
+        Self::open_with_options(dir, store, Options::new(flush_threshold))
     }
 
-    /// Like [`Self::open`], but choosing the per-write WAL durability.
+    /// Like [`Self::open`], but with full [`Options`] (per-write durability,
+    /// size-tiered compaction tuning, auto-compaction).
     ///
     /// [`SyncPolicy::Fsync`] requires a filesystem-backed `Directory`; opening
     /// with it on a backend that lacks `file_path()` (e.g. an in-memory
     /// directory) returns an error rather than silently degrading to a flush.
-    pub fn open_with_sync(
+    pub fn open_with_options(
         dir: Arc<dyn Directory>,
         store: S,
-        flush_threshold: usize,
-        sync: SyncPolicy,
+        opts: Options,
     ) -> PersistenceResult<Self> {
+        let Options {
+            flush_threshold,
+            sync,
+            tiering,
+            auto_compact,
+        } = opts;
         if sync == SyncPolicy::Fsync && dir.file_path(CKPT_PATH).is_none() {
             return Err(PersistenceError::InvalidConfig(
                 "SyncPolicy::Fsync requires a filesystem-backed Directory".into(),
@@ -261,6 +361,8 @@ impl<S: Store> SegmentedStore<S> {
             epoch,
             sync,
             flush_threshold,
+            tiering,
+            auto_compact,
         })
     }
 
@@ -272,6 +374,9 @@ impl<S: Store> SegmentedStore<S> {
         apply(&mut self.buffer, &mut self.tombstones, Op::Add(id, item));
         if self.buffer.len() >= self.flush_threshold {
             self.flush_buffer();
+            if self.auto_compact && self.has_eligible_tier() {
+                self.compact_tiers()?;
+            }
         }
         Ok(())
     }
@@ -303,18 +408,161 @@ impl<S: Store> SegmentedStore<S> {
         self.buffer.clear();
     }
 
-    /// Merge all segments into one, dropping tombstoned ids, then checkpoint.
-    pub fn compact(&mut self) -> PersistenceResult<()> {
+    /// Merge ALL segments into one, dropping tombstoned ids and purging the
+    /// tombstone set, then checkpoint. This is the full compaction; it is the only
+    /// path that touches frozen (over-cap) segments and the only one that purges
+    /// tombstones (a partial tier merge cannot, since a tombstoned id may live in a
+    /// segment it did not merge).
+    pub fn compact(&mut self) -> PersistenceResult<CompactionStats> {
         self.flush_buffer();
-        if !self.segments.is_empty() {
+        let before = self.segments.len();
+        let mut stats = CompactionStats {
+            segments_before: before,
+            ..Default::default()
+        };
+        // Nothing to do for 0/1 segments with no tombstones to purge.
+        if before > 1 || (before == 1 && !self.tombstones.is_empty()) {
             let tombstones = std::mem::take(&mut self.tombstones);
             let merged = self
                 .store
                 .merge_segments(&self.segments, &|id| !tombstones.contains(id));
+            stats.merges = 1;
+            stats.items_merged = self.store.segment_len(&merged);
             self.segments = vec![merged];
-            // Tombstones are now physically gone from the merged segment.
         }
-        self.checkpoint()
+        self.checkpoint()?;
+        stats.segments_after = self.segments.len();
+        Ok(stats)
+    }
+
+    /// Run all currently-eligible size-tier merges (size-tiered compaction) per the
+    /// [`TierConfig`], persisting the result if anything merged. Segments are grouped
+    /// into size buckets (a Cassandra-style `bucket_low .. bucket_high` band around a
+    /// running average, with a [`Options::flush_threshold`] floor); a bucket with at
+    /// least `min_merge` segments is merged (smallest first, up to `max_merge` at once,
+    /// never exceeding `max_merged_len` items), dropping tombstoned ids from the merged
+    /// output. Segments above `max_merged_len / 2` are frozen out, so the largest segment
+    /// is never rewritten here. The global tombstone set is NOT purged (only [`Self::compact`]
+    /// can); a tombstoned id surviving in a frozen segment stays filtered by [`Self::is_live`].
+    ///
+    /// Scheduling is the consumer's: call this when convenient (e.g. on a background
+    /// thread) so merge latency stays off the ingest path, or set [`Options::auto_compact`].
+    pub fn compact_tiers(&mut self) -> PersistenceResult<CompactionStats> {
+        self.flush_buffer();
+        let mut stats = CompactionStats {
+            segments_before: self.segments.len(),
+            ..Default::default()
+        };
+        while let Some(group) = self.next_merge_group() {
+            let segs: Vec<S::Segment> = group.iter().map(|&i| self.segments[i].clone()).collect();
+            let merged = {
+                let tombstones = &self.tombstones;
+                self.store
+                    .merge_segments(&segs, &|id| !tombstones.contains(id))
+            };
+            stats.items_merged += self.store.segment_len(&merged);
+            stats.merges += 1;
+            // Remove the merged segments (highest index first), then append the result.
+            let mut desc = group;
+            desc.sort_unstable_by(|a, b| b.cmp(a));
+            for i in desc {
+                self.segments.remove(i);
+            }
+            self.segments.push(merged);
+        }
+        if stats.merges > 0 {
+            self.checkpoint()?;
+        }
+        stats.segments_after = self.segments.len();
+        Ok(stats)
+    }
+
+    /// Whether at least one size bucket is eligible to merge right now.
+    pub fn has_eligible_tier(&self) -> bool {
+        self.next_merge_group().is_some()
+    }
+
+    /// Choose the next group of segment indices to merge (size-tiered selection), or
+    /// `None` if no bucket is eligible. Smallest-average bucket first.
+    fn next_merge_group(&self) -> Option<Vec<usize>> {
+        let cfg = self.tiering;
+        // A group of 1 would merge a segment into itself (no progress), so the loop
+        // in `compact_tiers` would not terminate. 2 is the floor regardless of config.
+        let min_merge = cfg.min_merge.max(2);
+        let floor = self.flush_threshold.max(1);
+        let cap_half = cfg.max_merged_len / 2;
+        // (raw size, floored size, index) for segments not frozen by the cap.
+        let mut elig: Vec<(usize, f64, usize)> = self
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let raw = self.store.segment_len(s);
+                (raw, raw.max(floor) as f64, i)
+            })
+            .filter(|&(raw, _, _)| raw <= cap_half)
+            .collect();
+        if elig.len() < min_merge {
+            return None;
+        }
+        elig.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+        // Cassandra-style bucketing: join the first bucket whose running average is
+        // within the size band, else open a new bucket.
+        let mut buckets: Vec<(f64, Vec<(usize, usize)>)> = Vec::new();
+        'item: for &(raw, sz, idx) in &elig {
+            for b in buckets.iter_mut() {
+                if sz > b.0 * cfg.bucket_low && sz < b.0 * cfg.bucket_high {
+                    let n = b.1.len() as f64;
+                    b.0 = (b.0 * n + sz) / (n + 1.0);
+                    b.1.push((raw, idx));
+                    continue 'item;
+                }
+            }
+            buckets.push((sz, vec![(raw, idx)]));
+        }
+        buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+
+        for (_, mut members) in buckets {
+            if members.len() < min_merge {
+                continue;
+            }
+            members.sort_by_key(|&(raw, _)| raw); // smallest first
+            let mut chosen = Vec::new();
+            let mut total = 0usize;
+            for &(raw, idx) in &members {
+                if chosen.len() >= cfg.max_merge {
+                    break;
+                }
+                if !chosen.is_empty() && total + raw > cfg.max_merged_len {
+                    break;
+                }
+                total += raw;
+                chosen.push(idx);
+            }
+            if chosen.len() >= min_merge {
+                return Some(chosen);
+            }
+        }
+        None
+    }
+
+    /// Total items physically stored across segments and the buffer. This counts
+    /// tombstoned-but-not-yet-purged items (segstore cannot see inside an opaque
+    /// segment to subtract them); pair with [`Self::tombstone_count`] to gauge
+    /// space amplification.
+    pub fn stored_len(&self) -> usize {
+        let in_segments: usize = self
+            .segments
+            .iter()
+            .map(|s| self.store.segment_len(s))
+            .sum();
+        in_segments + self.buffer.len()
+    }
+
+    /// The current WAL generation.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Snapshot the current segments + tombstones durably, then rotate the WAL:
@@ -420,6 +668,9 @@ mod tests {
                 .filter(|(id, _)| live(id))
                 .cloned()
                 .collect()
+        }
+        fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize {
+            seg.len()
         }
     }
 
@@ -635,7 +886,11 @@ mod tests {
         let root = temp_root("fsync");
         {
             let dir = durability::FsDirectory::arc(&root).unwrap();
-            let mut s = SegmentedStore::open_with_sync(dir, Kv, 2, SyncPolicy::Fsync).unwrap();
+            let opts = Options {
+                sync: SyncPolicy::Fsync,
+                ..Options::new(2)
+            };
+            let mut s = SegmentedStore::open_with_options(dir, Kv, opts).unwrap();
             s.add(1, "a".into()).unwrap();
             s.add(2, "b".into()).unwrap(); // flush
             s.checkpoint().unwrap();
@@ -643,7 +898,11 @@ mod tests {
             s.delete(2).unwrap();
         }
         let dir = durability::FsDirectory::arc(&root).unwrap();
-        let s2 = SegmentedStore::open_with_sync(dir, Kv, 2, SyncPolicy::Fsync).unwrap();
+        let opts = Options {
+            sync: SyncPolicy::Fsync,
+            ..Options::new(2)
+        };
+        let s2 = SegmentedStore::open_with_options(dir, Kv, opts).unwrap();
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (3, "c".into())]);
         assert!(!s2.is_live(&2));
         let _ = std::fs::remove_dir_all(&root);
@@ -652,7 +911,11 @@ mod tests {
     #[test]
     fn fsync_policy_rejected_without_filesystem_backend() {
         let dir = MemoryDirectory::arc();
-        let err = SegmentedStore::open_with_sync(dir, Kv, 2, SyncPolicy::Fsync);
+        let opts = Options {
+            sync: SyncPolicy::Fsync,
+            ..Options::new(2)
+        };
+        let err = SegmentedStore::open_with_options(dir, Kv, opts);
         assert!(
             matches!(err, Err(PersistenceError::InvalidConfig(_))),
             "Fsync on an in-memory directory is a config error"
@@ -674,6 +937,200 @@ mod tests {
         assert!(
             matches!(err, Err(PersistenceError::InvalidConfig(_))),
             "a 0.1 on-disk store is rejected, not misread"
+        );
+    }
+
+    // ---- size-tiered compaction ----
+
+    /// The live `(id, item)` multiset, sorted, for invariant comparisons.
+    fn live_multiset(s: &SegmentedStore<Kv>) -> Vec<(u32, String)> {
+        live_set(s)
+    }
+
+    fn tier_opts(flush: usize, cfg: TierConfig, auto: bool) -> Options {
+        Options {
+            tiering: cfg,
+            auto_compact: auto,
+            ..Options::new(flush)
+        }
+    }
+
+    #[test]
+    fn compact_tiers_merges_a_full_bucket_and_is_idempotent() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig {
+            min_merge: 4,
+            ..Default::default()
+        };
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(2, cfg, false)).unwrap();
+        // 8 adds at flush=2 -> 4 segments of size 2: one full bucket.
+        for i in 0..8u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        assert_eq!(
+            s.segment_count(),
+            4,
+            "four size-2 segments before compaction"
+        );
+        let stats = s.compact_tiers().unwrap();
+        assert_eq!(stats.merges, 1, "the full bucket merges once");
+        assert_eq!(s.segment_count(), 1, "into a single segment");
+        assert_eq!(stats.items_merged, 8);
+        // Idempotent: nothing eligible now.
+        assert!(!s.has_eligible_tier());
+        let again = s.compact_tiers().unwrap();
+        assert_eq!(again.merges, 0, "second call is a no-op");
+    }
+
+    #[test]
+    fn tier_merge_respects_max_merged_len_cap() {
+        let dir = MemoryDirectory::arc();
+        // cap = 8 -> segments above 4 are frozen; 4 size-2 segments merge to exactly 8.
+        let cfg = TierConfig {
+            min_merge: 4,
+            max_merged_len: 8,
+            ..Default::default()
+        };
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(2, cfg, true)).unwrap();
+        for i in 0..64u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        s.compact_tiers().unwrap();
+        for seg in s.segments() {
+            assert!(
+                seg.len() <= cfg.max_merged_len,
+                "no segment exceeds the cap; got {}",
+                seg.len()
+            );
+        }
+    }
+
+    #[test]
+    fn auto_compact_bounds_segment_count() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig::default(); // min_merge 4, large cap
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(2, cfg, true)).unwrap();
+        // 200 adds at flush=2 would be 100 segments without compaction.
+        for i in 0..200u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        s.compact_tiers().unwrap();
+        assert!(
+            s.segment_count() <= 20,
+            "tiering bounds segment count well below the uncompacted 100; got {}",
+            s.segment_count()
+        );
+        // No data lost.
+        assert_eq!(live_multiset(&s).len(), 200);
+    }
+
+    #[test]
+    fn tier_merge_preserves_live_set_and_keeps_tombstones() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig {
+            min_merge: 4,
+            max_merged_len: 8, // force some frozen segments
+            ..Default::default()
+        };
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(2, cfg, false)).unwrap();
+        let mut expect: std::collections::BTreeMap<u32, String> = Default::default();
+        for i in 0..40u32 {
+            s.add(i, format!("v{i}")).unwrap();
+            expect.insert(i, format!("v{i}"));
+        }
+        // Delete a spread of ids (some land in soon-to-be-frozen segments).
+        for i in (0..40u32).step_by(5) {
+            s.delete(i).unwrap();
+            expect.remove(&i);
+        }
+        s.compact_tiers().unwrap();
+        let want: Vec<(u32, String)> = expect.into_iter().collect();
+        assert_eq!(live_multiset(&s), want, "tier merge preserves the live set");
+        assert!(
+            s.tombstone_count() > 0,
+            "partial tier merge keeps the tombstone set (ids may live in frozen segments)"
+        );
+        // Full compaction purges the tombstones.
+        s.compact().unwrap();
+        assert_eq!(s.tombstone_count(), 0, "full compact purges tombstones");
+        assert_eq!(live_multiset(&s), want, "and preserves the live set");
+    }
+
+    #[test]
+    fn min_merge_below_two_terminates() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig {
+            min_merge: 1, // would group-of-1 forever without the clamp
+            ..Default::default()
+        };
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(1, cfg, false)).unwrap();
+        for i in 0..8u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        // Must terminate (clamp forces min_merge >= 2).
+        let stats = s.compact_tiers().unwrap();
+        assert!(stats.segments_after <= stats.segments_before);
+        assert_eq!(live_multiset(&s).len(), 8);
+    }
+
+    #[test]
+    fn large_scale_random_simulation_holds_invariants() {
+        let dir = MemoryDirectory::arc();
+        let cfg = TierConfig {
+            min_merge: 4,
+            max_merge: 8,
+            max_merged_len: 64,
+            ..Default::default()
+        };
+        let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(3, cfg, true)).unwrap();
+        // Unique ids per add (segstore makes no dedup promise; identity is the
+        // Store impl's job, and the toy Kv appends duplicates on re-add). A
+        // monotonic id keeps the reference model exact while still exercising
+        // insert/delete/merge invariants.
+        let mut expect: std::collections::BTreeMap<u32, String> = Default::default();
+        let mut live_ids: Vec<u32> = Vec::new();
+        let mut next_id = 0u32;
+        // Deterministic LCG (no rand dep, no Math.random).
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..2000 {
+            if next() % 4 == 0 && !live_ids.is_empty() {
+                let pos = (next() as usize) % live_ids.len();
+                let id = live_ids.swap_remove(pos);
+                s.delete(id).unwrap();
+                expect.remove(&id);
+            } else {
+                let id = next_id;
+                next_id += 1;
+                let v = format!("v{id}");
+                s.add(id, v.clone()).unwrap();
+                expect.insert(id, v);
+                live_ids.push(id);
+            }
+            if next() % 50 == 0 {
+                s.compact_tiers().unwrap();
+            }
+            // Invariant: every segment is within the cap.
+            for seg in s.segments() {
+                assert!(
+                    seg.len() <= cfg.max_merged_len,
+                    "seg size {} exceeds cap {}",
+                    seg.len(),
+                    cfg.max_merged_len
+                );
+            }
+        }
+        s.compact().unwrap();
+        let want: Vec<(u32, String)> = expect.into_iter().collect();
+        assert_eq!(
+            live_multiset(&s),
+            want,
+            "after a long random run, the live set matches the reference"
         );
     }
 }

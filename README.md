@@ -66,6 +66,21 @@ one is never rewritten by tiering. Scheduling is the consumer's: call
 `CompactionStats` returned by both expose the segment-count and merge-cost signal
 to watch as the corpus grows.
 
+For bulk ingest (an index build phase), `extend(items)` syncs the WAL once per
+batch instead of per item.
+
+## Concurrent reads
+
+Single writer, many readers. `reader()` returns a cloneable, thread-safe `Reader`;
+`reader.view()` takes a consistent point-in-time `View` of the segments and
+tombstones that a query holds (lock-free) for its whole duration, even while the
+writer adds, deletes, or compacts on another thread. A view has commit-style
+visibility: it sees sealed segments plus tombstones, so adds still buffered in the
+writer become visible after the next flush. This is the same snapshot model as
+Lucene's `SearcherManager` / Tantivy's `Searcher`, made light by segstore's
+in-memory segments (a `View` is `Arc` clones; an old segment's memory frees when
+the last view holding it drops).
+
 ## Status
 
 0.x; the API and on-disk format may change between minor versions.

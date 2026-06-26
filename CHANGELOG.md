@@ -9,15 +9,25 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Added
 
+- Concurrent snapshot reads: `reader()` returns a cloneable, thread-safe `Reader`;
+  `Reader::view()` takes a consistent point-in-time `View` (Arc-shared segments +
+  tombstones) that a query holds lock-free while the writer adds/deletes/compacts
+  concurrently (single-writer, many-readers). Commit-style visibility: a view sees
+  sealed segments + tombstones.
 - Size-tiered compaction: `compact_tiers()` runs Cassandra/Lucene-style size-tiered
   merges (size-banded buckets, `min_merge`/`max_merge`, a `max_merged_len` cap that
   freezes the largest segment out of tiering), tuned by `TierConfig`. Scheduling is
   consumer-driven, or set `Options::auto_compact` to merge inline after a flush.
+- `extend(items)`: bulk-ingest that syncs the WAL once per batch instead of per item
+  (the index build phase); a crash mid-batch leaves a consistent prefix.
+- `force_merge_to(n)`: on-demand consolidation to at most `n` segments.
+- Tombstone reclamation: an optional `Store::live_len` (default `None`) enables
+  `space_amplification()` and `reclaim_tombstones(min_live_ratio)`, which rewrites
+  only tombstone-heavy segments.
 - `SyncPolicy::Fsync` (via `open_with_options`): fsync every WAL record to stable
   storage on a filesystem backend. The default `Flush` is unchanged.
-- Instrumentation: `compact()` and `compact_tiers()` return `CompactionStats`;
-  `segment_sizes()`, `stored_len()`, and `epoch()` expose the segment-count and
-  merge-cost signal to watch as the corpus grows.
+- Instrumentation: `compact()`/`compact_tiers()`/`force_merge_to()` return
+  `CompactionStats`; `segment_sizes()`, `stored_len()`, `epoch()`.
 
 ### Changed
 
@@ -28,6 +38,12 @@ unstable: minor bumps may break the public API and the on-disk format.
 - Checkpoints publish atomically (CRC-checked) and, on a filesystem backend, pass an
   fsync barrier on the checkpoint file and its parent directory.
 - `compact()` now returns `CompactionStats`.
+
+### Fixed
+
+- A full compaction of an all-deleted store no longer leaves an empty segment, and
+  `compact()` purges the tombstone set unconditionally (no stale tombstones for ids
+  that were only ever buffered).
 
 ### Removed
 

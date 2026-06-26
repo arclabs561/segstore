@@ -1455,12 +1455,10 @@ mod tests {
         }
         assert_eq!(s.segment_count(), 10);
         let stats = s.force_merge_to(3).unwrap();
-        assert!(
-            s.segment_count() <= 3,
-            "consolidated to <= 3, got {}",
-            s.segment_count()
-        );
+        // Minimum work: consolidates to exactly 3 (not fewer), like Lucene forceMerge.
+        assert_eq!(s.segment_count(), 3, "consolidated to exactly 3");
         assert!(stats.merges > 0);
+        assert!(stats.items_merged > 0, "merged work is reported");
         assert_eq!(live_multiset(&s).len(), 20, "no data lost");
     }
 
@@ -1488,9 +1486,27 @@ mod tests {
         for i in 0..4u32 {
             s.add(i, format!("v{i}")).unwrap(); // 2 segments
         }
+        let e = s.epoch();
         let stats = s.force_merge_to(5).unwrap();
         assert_eq!(stats.merges, 0, "already at/below target, nothing to merge");
         assert_eq!(s.segment_count(), 2);
+        assert_eq!(s.epoch(), e, "no merge -> no checkpoint");
+    }
+
+    #[test]
+    fn force_merge_persists_across_reopen() {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+            for i in 0..20u32 {
+                s.add(i, format!("v{i}")).unwrap(); // 10 segments
+            }
+            s.force_merge_to(2).unwrap();
+            assert_eq!(s.segment_count(), 2);
+        }
+        let s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(s.segment_count(), 2, "force-merge result was checkpointed");
+        assert_eq!(live_multiset(&s).len(), 20);
     }
 
     /// Tiering rewrites each item O(log) times, so the total merged work over N
@@ -1621,6 +1637,7 @@ mod tests {
             stats.merges, 1,
             "only the sub-threshold segment is reclaimed"
         );
+        assert_eq!(stats.items_merged, 1, "A's single live item is rewritten");
         assert_eq!(
             s.segment_count(),
             3,

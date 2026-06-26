@@ -534,13 +534,18 @@ impl<S: Store> SegmentedStore<S> {
                 .merge_segments(&segs, &|id| !tombstones.contains(id))
         };
         let n = self.store.segment_len(&merged);
-        // Remove the merged segments (highest index first), then append the result
-        // unless it is empty (a fully-tombstoned group leaves no segment behind).
-        let mut desc = indices;
-        desc.sort_unstable_by(|a, b| b.cmp(a));
-        for i in desc {
-            self.segments.remove(i);
-        }
+        // Rebuild the segment list in one O(n) pass (filtering the merged indices)
+        // instead of k O(n) `Vec::remove` calls, then append the result unless it is
+        // empty (a fully-tombstoned group leaves no segment behind).
+        let mut merged_idx = indices;
+        merged_idx.sort_unstable();
+        let old = std::mem::take(&mut self.segments);
+        self.segments = old
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| merged_idx.binary_search(i).is_err())
+            .map(|(_, seg)| seg)
+            .collect();
         if n > 0 {
             self.segments.push(merged);
         }

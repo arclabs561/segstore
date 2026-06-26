@@ -16,3 +16,6 @@ categories = ["data-structures", "database-implementations"]
 [dependencies]
 durability = "0.6"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"

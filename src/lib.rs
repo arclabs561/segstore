@@ -565,6 +565,17 @@ impl<S: Store> SegmentedStore<S> {
         self.epoch
     }
 
+    /// Per-segment item counts, oldest segment first. The size distribution the
+    /// consumer needs to watch the crossover signal (segment count + per-query
+    /// fan-out vs corpus size) that says a multi-segment store is outgrowing the
+    /// search-all-segments model.
+    pub fn segment_sizes(&self) -> Vec<usize> {
+        self.segments
+            .iter()
+            .map(|s| self.store.segment_len(s))
+            .collect()
+    }
+
     /// Snapshot the current segments + tombstones durably, then rotate the WAL:
     /// start a fresh epoch and delete the old log so it cannot grow unbounded.
     ///
@@ -1132,5 +1143,152 @@ mod tests {
             want,
             "after a long random run, the live set matches the reference"
         );
+    }
+
+    #[test]
+    fn segment_sizes_reports_per_segment_counts() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..6u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 3 segments of size 2
+        }
+        assert_eq!(s.segment_sizes(), vec![2, 2, 2]);
+        assert_eq!(s.stored_len(), 6);
+    }
+
+    /// The store must be `Send` so the consumer can drive `compact_tiers` on a
+    /// background thread (the whole point of consumer-driven scheduling).
+    #[test]
+    fn store_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SegmentedStore<Kv>>();
+    }
+
+    // ---- checkpoint integrity (crash injection) ----
+
+    #[test]
+    fn corrupt_checkpoint_is_rejected_not_misread() {
+        let root = temp_root("corrupt-ckpt");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.checkpoint().unwrap();
+        }
+        // Flip a byte in the middle of the checkpoint payload (past the header).
+        let ckpt = root.join(CKPT_PATH);
+        let mut bytes = std::fs::read(&ckpt).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&ckpt, &bytes).unwrap();
+
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let res = SegmentedStore::open(dir, Kv, 2);
+        assert!(
+            res.is_err(),
+            "a CRC-corrupt checkpoint is an error, not silently misread"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_checkpoint_tmp_is_ignored() {
+        let root = temp_root("stale-tmp");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.checkpoint().unwrap();
+        }
+        // A crash mid atomic_write can leave a `<ckpt>.tmp` next to the real file.
+        std::fs::write(root.join(format!("{CKPT_PATH}.tmp")), b"garbage").unwrap();
+
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let s2 = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(live_set(&s2), vec![(1, "a".into()), (2, "b".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // ---- property-based: random op sequences vs a reference model ----
+
+    use proptest::prelude::*;
+
+    /// An op applied to both the store and a reference model. `Add` uses a fresh
+    /// unique id (segstore makes no dedup promise, and compaction reorders
+    /// segments, so re-adds of one id have no last-write-wins guarantee); `Delete`
+    /// targets the k-th currently-live id.
+    #[derive(Debug, Clone)]
+    enum SimOp {
+        Add,
+        Delete(usize),
+        Compact,
+        CompactTiers,
+        Reopen,
+    }
+
+    fn op_strategy() -> impl Strategy<Value = SimOp> {
+        prop_oneof![
+            3 => Just(SimOp::Add),
+            2 => (0usize..100).prop_map(SimOp::Delete),
+            1 => Just(SimOp::Compact),
+            1 => Just(SimOp::CompactTiers),
+            1 => Just(SimOp::Reopen),
+        ]
+    }
+
+    proptest! {
+        /// For any sequence of add/delete/compact/compact_tiers/reopen, the live set
+        /// equals the reference model and every segment stays within the cap.
+        #[test]
+        fn live_set_matches_reference_under_random_ops(
+            ops in proptest::collection::vec(op_strategy(), 0..200)
+        ) {
+            let dir = MemoryDirectory::arc();
+            let cfg = TierConfig {
+                min_merge: 4,
+                max_merge: 8,
+                max_merged_len: 64,
+                ..Default::default()
+            };
+            let mk = || Options { tiering: cfg, ..Options::new(3) };
+            let mut s = SegmentedStore::open_with_options(dir.clone(), Kv, mk()).unwrap();
+            let mut model: std::collections::BTreeMap<u32, String> = Default::default();
+            let mut live_ids: Vec<u32> = Vec::new();
+            let mut next_id = 0u32;
+            for op in ops {
+                match op {
+                    SimOp::Add => {
+                        let id = next_id;
+                        next_id += 1;
+                        let v = format!("v{id}");
+                        s.add(id, v.clone()).unwrap();
+                        model.insert(id, v);
+                        live_ids.push(id);
+                    }
+                    SimOp::Delete(k) => {
+                        if !live_ids.is_empty() {
+                            let id = live_ids.swap_remove(k % live_ids.len());
+                            s.delete(id).unwrap();
+                            model.remove(&id);
+                        }
+                    }
+                    SimOp::Compact => {
+                        s.compact().unwrap();
+                    }
+                    SimOp::CompactTiers => {
+                        s.compact_tiers().unwrap();
+                    }
+                    SimOp::Reopen => {
+                        s = SegmentedStore::open_with_options(dir.clone(), Kv, mk()).unwrap();
+                    }
+                }
+                for sz in s.segment_sizes() {
+                    prop_assert!(sz <= cfg.max_merged_len);
+                }
+            }
+            let want: Vec<(u32, String)> = model.into_iter().collect();
+            prop_assert_eq!(live_set(&s), want);
+        }
     }
 }

@@ -842,6 +842,67 @@ mod tests {
         }
     }
 
+    /// A `Directory` that fails its Nth mutating operation (and every one after),
+    /// to test IO-error propagation and crash atomicity. Reads always succeed.
+    struct FaultDir {
+        inner: Arc<dyn Directory>,
+        countdown: std::sync::atomic::AtomicUsize,
+    }
+    impl FaultDir {
+        fn arc(inner: Arc<dyn Directory>, fail_after: usize) -> Arc<dyn Directory> {
+            Arc::new(FaultDir {
+                inner,
+                countdown: std::sync::atomic::AtomicUsize::new(fail_after),
+            })
+        }
+        fn gate(&self) -> PersistenceResult<()> {
+            use std::sync::atomic::Ordering::Relaxed;
+            let n = self.countdown.load(Relaxed);
+            if n == 0 {
+                return Err(PersistenceError::InvalidState("injected IO fault".into()));
+            }
+            self.countdown.store(n - 1, Relaxed);
+            Ok(())
+        }
+    }
+    impl Directory for FaultDir {
+        fn create_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.gate()?;
+            self.inner.create_file(p)
+        }
+        fn open_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
+            self.inner.open_file(p)
+        }
+        fn exists(&self, p: &str) -> bool {
+            self.inner.exists(p)
+        }
+        fn delete(&self, p: &str) -> PersistenceResult<()> {
+            self.gate()?;
+            self.inner.delete(p)
+        }
+        fn atomic_rename(&self, a: &str, b: &str) -> PersistenceResult<()> {
+            self.gate()?;
+            self.inner.atomic_rename(a, b)
+        }
+        fn create_dir_all(&self, p: &str) -> PersistenceResult<()> {
+            self.inner.create_dir_all(p)
+        }
+        fn list_dir(&self, p: &str) -> PersistenceResult<Vec<String>> {
+            self.inner.list_dir(p)
+        }
+        fn append_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.gate()?;
+            self.inner.append_file(p)
+        }
+        fn atomic_write(&self, p: &str, d: &[u8]) -> PersistenceResult<()> {
+            self.gate()?;
+            self.inner.atomic_write(p, d)
+        }
+        fn file_path(&self, p: &str) -> Option<std::path::PathBuf> {
+            self.inner.file_path(p)
+        }
+    }
+
     /// Collect the live `(id, item)` set across segments + buffer.
     fn live_set(s: &SegmentedStore<Kv>) -> Vec<(u32, String)> {
         let mut out: Vec<(u32, String)> = Vec::new();
@@ -1366,6 +1427,40 @@ mod tests {
         let s2 = SegmentedStore::open(dir, Kv, 2).unwrap();
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (2, "b".into())]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovers_consistently_from_io_fault_at_every_step() {
+        // FoundationDB-style fault injection: fail the Nth IO op, then reopen on
+        // the underlying (un-faulted) directory and assert the recovered live set
+        // is EXACTLY the durably-acked adds -- every Ok(add) survives, no failed add
+        // appears, recovery never panics and never sees corruption. Sweeps the
+        // fault point across the whole op sequence.
+        for fail_after in 0..30usize {
+            let mem = MemoryDirectory::arc();
+            let dir = FaultDir::arc(mem.clone(), fail_after);
+            let mut acked: Vec<u32> = Vec::new();
+            if let Ok(mut s) = SegmentedStore::open(dir, Kv, 2) {
+                for i in 0..10u32 {
+                    if s.add(i, format!("v{i}")).is_err() {
+                        break;
+                    }
+                    acked.push(i);
+                    if i % 3 == 0 && s.compact_tiers().is_err() {
+                        break;
+                    }
+                }
+            }
+            // Reopen on the clean underlying directory (the partial on-disk state).
+            let s2 = SegmentedStore::open(mem, Kv, 2)
+                .expect("recovery after an injected IO fault must not fail");
+            let mut live: Vec<u32> = live_set(&s2).into_iter().map(|(id, _)| id).collect();
+            live.sort_unstable();
+            assert_eq!(
+                live, acked,
+                "fail_after={fail_after}: recovered set must be exactly the durably-acked adds"
+            );
+        }
     }
     // ---- tombstone reclamation (optional live_len) ----
 

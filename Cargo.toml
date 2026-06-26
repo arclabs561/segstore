@@ -1,0 +1,18 @@
+[package]
+name = "segstore"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+authors = ["Arc <attobop@gmail.com>"]
+description = "Generic durable segmented store: write-ahead log, immutable segments, tombstones, checkpoint, and compaction"
+repository = "https://github.com/arclabs561/segstore"
+documentation = "https://docs.rs/segstore"
+keywords = ["lsm", "wal", "segments", "index", "persistence"]
+categories = ["data-structures", "database-implementations"]
+
+[workspace]
+
+[dependencies]
+durability = "0.6"
+serde = { version = "1", features = ["derive"] }

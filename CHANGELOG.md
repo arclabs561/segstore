@@ -5,15 +5,15 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The 0.x series is
 unstable: minor bumps may break the public API and the on-disk format.
 
-## [Unreleased]
+## [0.2.0] - 2026-06-26
 
 ### Added
 
 - Concurrent snapshot reads: `reader()` returns a cloneable, thread-safe `Reader`;
   `Reader::view()` takes a consistent point-in-time `View` (Arc-shared segments +
   tombstones) that a query holds lock-free while the writer adds/deletes/compacts
-  concurrently (single-writer, many-readers). Commit-style visibility: a view sees
-  sealed segments + tombstones.
+  concurrently (single-writer, many-readers). Commit-style visibility: a view
+  reflects state as of the last `checkpoint()`.
 - Size-tiered compaction: `compact_tiers()` runs Cassandra/Lucene-style size-tiered
   merges (size-banded buckets, `min_merge`/`max_merge`, a `max_merged_len` cap that
   freezes the largest segment out of tiering), tuned by `TierConfig`. Scheduling is
@@ -53,6 +53,9 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 - `Store` now requires `segment_len(&Segment) -> usize` (the size metric size-tiered
   compaction groups by; `seg.len()` for a `Vec`-backed segment).
+- `segments()` now returns `&[Arc<Segment>]` (was `&[Segment]`): segments are `Arc`-shared
+  so an unchanged segment keeps a stable identity across mutations, letting a consumer
+  cache per-segment state keyed by `Arc::as_ptr` and rebuild only new segments.
 - On-disk format changed (epoch-suffixed WAL files; the checkpoint records the epoch
   rather than an op count). A 0.1.0 store is detected and rejected with a clear error
   rather than misread.

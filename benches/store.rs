@@ -45,7 +45,7 @@ fn fill(s: &mut SegmentedStore<Kv>, n: u32) {
 
 fn bench_add(c: &mut Criterion) {
     let mut g = c.benchmark_group("add");
-    for &n in &[1_000u32, 4_000] {
+    for &n in &[1_000u32, 4_000, 16_000] {
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(|| fresh(64), |mut s| fill(&mut s, n), BatchSize::SmallInput);
         });
@@ -55,7 +55,7 @@ fn bench_add(c: &mut Criterion) {
 
 fn bench_compact_tiers(c: &mut Criterion) {
     let mut g = c.benchmark_group("compact_tiers_drain");
-    for &n in &[1_000u32, 4_000] {
+    for &n in &[1_000u32, 4_000, 16_000] {
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
                 || {

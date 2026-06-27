@@ -275,9 +275,11 @@ struct PubState<S: Store> {
 ///
 /// A [`Reader`] hands these out; holding one keeps its segments alive for the whole
 /// query even as the writer adds, deletes, or compacts concurrently (single-writer,
-/// many-readers, like Lucene's `SearcherManager` / Tantivy's `Searcher`). The view
-/// reflects state as of the last *sealed* segment + tombstones; adds still buffered
-/// in the writer become visible after the next flush.
+/// many-readers, like Lucene's `SearcherManager` / Tantivy's `Searcher`). Visibility
+/// is *commit-style*: a view reflects the state as of the last [`SegmentedStore::checkpoint`]
+/// (which compaction also performs), so adds and deletes since then become visible
+/// after the next checkpoint. Publishing only at the checkpoint keeps it off the
+/// ingest hot path (republishing per write made bulk ingest quadratic).
 pub struct View<S: Store> {
     segments: Arc<Vec<Arc<S::Segment>>>,
     tombstones: Arc<HashSet<S::Id>>,
@@ -469,10 +471,9 @@ impl<S: Store> SegmentedStore<S> {
     }
 
     /// Rebuild the published snapshot from the current segments + tombstones. Called
-    /// after any mutation that changes what a reader should see (a sealed segment, a
-    /// delete, a compaction). v1 clones the segment data into the new published view;
-    /// holding segments as `Arc` internally to make this a refcount-only publish is a
-    /// future optimization if publish cost shows up under profiling.
+    /// only at the checkpoint (commit point), so it stays off the per-write ingest
+    /// path. Clones the segment data into the new view; since it runs per checkpoint
+    /// (not per write), the cost is amortized over a whole commit interval.
     fn republish(&self) {
         let segments: Vec<Arc<S::Segment>> =
             self.segments.iter().map(|s| Arc::new(s.clone())).collect();
@@ -538,7 +539,6 @@ impl<S: Store> SegmentedStore<S> {
             .append_postcard::<Op<S::Id, S::Item>>(&Op::Delete(id.clone()))?;
         self.sync_wal()?;
         apply(&mut self.buffer, &mut self.tombstones, Op::Delete(id));
-        self.republish();
         Ok(())
     }
 
@@ -558,7 +558,6 @@ impl<S: Store> SegmentedStore<S> {
         let seg = self.store.build_segment(&self.buffer);
         self.segments.push(seg);
         self.buffer.clear();
-        self.republish();
     }
 
     /// Merge ALL segments into one, dropping tombstoned ids and purging the
@@ -2056,6 +2055,7 @@ mod tests {
             s.add(i, format!("v{i}")).unwrap();
         }
         s.delete(2).unwrap();
+        s.checkpoint().unwrap(); // commit-visibility: publish to readers
         let v = s.reader().view();
         let mut live: Vec<u32> = Vec::new();
         for seg in v.segments() {
@@ -2069,7 +2069,7 @@ mod tests {
         assert_eq!(
             live,
             vec![0, 1, 3, 4, 5],
-            "view = sealed segments minus tombstones"
+            "view = checkpointed segments minus tombstones"
         );
     }
 
@@ -2079,6 +2079,7 @@ mod tests {
         for i in 0..6u32 {
             s.add(i, format!("v{i}")).unwrap(); // 3 segments
         }
+        s.checkpoint().unwrap(); // publish the 3 segments to readers
         let reader = s.reader();
         let v1 = reader.view();
         let before = v1.segment_count();

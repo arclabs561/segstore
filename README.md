@@ -74,12 +74,14 @@ batch instead of per item.
 Single writer, many readers. `reader()` returns a cloneable, thread-safe `Reader`;
 `reader.view()` takes a consistent point-in-time `View` of the segments and
 tombstones that a query holds (lock-free) for its whole duration, even while the
-writer adds, deletes, or compacts on another thread. A view has commit-style
-visibility: it sees sealed segments plus tombstones, so adds still buffered in the
-writer become visible after the next flush. This is the same snapshot model as
-Lucene's `SearcherManager` / Tantivy's `Searcher`, made light by segstore's
+writer adds, deletes, or compacts on another thread. Visibility is commit-style:
+a view reflects the state as of the last `checkpoint()` (which compaction also
+performs), so writes since then become visible after the next checkpoint. This is
+the Lucene `SearcherManager` / Tantivy `Searcher` model, made light by segstore's
 in-memory segments (a `View` is `Arc` clones; an old segment's memory frees when
-the last view holding it drops).
+the last view holding it drops). Publishing only at the checkpoint keeps the
+snapshot off the ingest hot path -- republishing per write would make bulk ingest
+quadratic.
 
 ## Status
 

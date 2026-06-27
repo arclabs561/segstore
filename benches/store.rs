@@ -109,11 +109,62 @@ fn bench_recovery(c: &mut Criterion) {
     g.finish();
 }
 
+/// Bulk ingest on a real filesystem: per-item add (one WAL flush per item) vs
+/// extend (one flush for the batch). In-memory hides this (flush is free); on disk
+/// the flush is the cost extend amortizes.
+fn bench_ingest_fs(c: &mut Criterion) {
+    use durability::FsDirectory;
+    let mut g = c.benchmark_group("ingest_fs_2k");
+    let n = 2_000u32;
+    let mk = |tag: &str| {
+        let mut p = std::env::temp_dir();
+        p.push(format!("segbench-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    };
+    g.bench_function("add", |b| {
+        b.iter_batched(
+            || mk("add"),
+            |p| {
+                let mut s = SegmentedStore::open_with_options(
+                    FsDirectory::arc(&p).unwrap(),
+                    Kv,
+                    Options::new(256),
+                )
+                .unwrap();
+                for i in 0..n {
+                    s.add(i, format!("v{i}")).unwrap();
+                }
+                let _ = std::fs::remove_dir_all(&p);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    g.bench_function("extend", |b| {
+        b.iter_batched(
+            || mk("extend"),
+            |p| {
+                let mut s = SegmentedStore::open_with_options(
+                    FsDirectory::arc(&p).unwrap(),
+                    Kv,
+                    Options::new(256),
+                )
+                .unwrap();
+                s.extend((0..n).map(|i| (i, format!("v{i}")))).unwrap();
+                let _ = std::fs::remove_dir_all(&p);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_add,
     bench_compact_tiers,
     bench_full_compact,
-    bench_recovery
+    bench_recovery,
+    bench_ingest_fs
 );
 criterion_main!(benches);

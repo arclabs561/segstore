@@ -1740,6 +1740,22 @@ mod tests {
         assert_eq!(s.segment_count(), before);
     }
 
+    #[test]
+    fn reclaim_drops_a_fully_dead_segment() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..4u32 {
+            s.add(i, format!("v{i}")).unwrap(); // segment A=[0,1], B=[2,3]
+        }
+        assert_eq!(s.segment_count(), 2);
+        s.delete(0).unwrap();
+        s.delete(1).unwrap(); // segment A is now 0% live
+        s.reclaim_tombstones(0.5).unwrap();
+        // A's merge produces an empty segment, which is dropped (not kept as empty).
+        assert_eq!(s.segment_count(), 1, "the fully-dead segment is dropped");
+        assert_eq!(s.stored_len(), 2, "only the live segment remains");
+    }
+
     // ---- force-merge / on-demand consolidation ----
 
     #[test]

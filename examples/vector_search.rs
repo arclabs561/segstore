@@ -62,7 +62,7 @@ fn dist2(a: &[f32], b: &[f32]) -> f32 {
 fn knn(index: &SegmentedStore<VectorIndex>, query: &[f32], k: usize) -> Vec<u32> {
     let mut cand: Vec<(u32, f32)> = Vec::new();
     for seg in index.segments() {
-        for (id, v) in seg {
+        for (id, v) in seg.iter() {
             if index.is_live(id) {
                 cand.push((*id, dist2(query, v)));
             }

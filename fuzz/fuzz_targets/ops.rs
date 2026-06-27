@@ -60,7 +60,7 @@ enum Op {
 fn live_set(s: &SegmentedStore<Kv>) -> Vec<(u32, String)> {
     let mut out: Vec<(u32, String)> = Vec::new();
     for seg in s.segments() {
-        for (id, it) in seg {
+        for (id, it) in seg.iter() {
             if s.is_live(id) {
                 out.push((*id, it.clone()));
             }

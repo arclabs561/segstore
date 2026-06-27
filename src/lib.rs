@@ -337,7 +337,7 @@ pub struct SegmentedStore<S: Store> {
     /// Live adds not yet flushed into a segment.
     buffer: Vec<(S::Id, S::Item)>,
     /// Immutable segments, oldest first.
-    segments: Vec<S::Segment>,
+    segments: Vec<Arc<S::Segment>>,
     /// Logically-deleted ids.
     tombstones: HashSet<S::Id>,
     /// Published snapshot for concurrent readers (rebuilt on each mutation).
@@ -403,15 +403,16 @@ impl<S: Store> SegmentedStore<S> {
 
         // Load the checkpoint snapshot if one exists. The checkpoint records the
         // WAL epoch it covers; recovery replays only that epoch's WAL.
-        let (epoch, segments, mut tombstones): (u64, Vec<S::Segment>, HashSet<S::Id>) =
-            if dir.exists(CKPT_PATH) {
-                let ckpt = CheckpointFile::new(dir.clone());
-                let (epoch, snap): (u64, Snapshot<S::Id, S::Segment>) =
-                    ckpt.read_postcard(CKPT_PATH)?;
-                (epoch, snap.segments, snap.tombstones.into_iter().collect())
-            } else {
-                (0, Vec::new(), HashSet::new())
-            };
+        let mut segments: Vec<Arc<S::Segment>> = Vec::new();
+        let mut tombstones: HashSet<S::Id> = HashSet::new();
+        let mut epoch = 0u64;
+        if dir.exists(CKPT_PATH) {
+            let ckpt = CheckpointFile::new(dir.clone());
+            let (e, snap): (u64, Snapshot<S::Id, S::Segment>) = ckpt.read_postcard(CKPT_PATH)?;
+            epoch = e;
+            segments = snap.segments.into_iter().map(Arc::new).collect();
+            tombstones = snap.tombstones.into_iter().collect();
+        }
 
         // Replay the current epoch's WAL in full. It holds exactly the ops since
         // the checkpoint, so every record is applied (no skip offset).
@@ -443,7 +444,7 @@ impl<S: Store> SegmentedStore<S> {
 
         let wal = RecordLogWriter::new(dir.clone(), live_wal);
         let published = Arc::new(std::sync::RwLock::new(Arc::new(PubState {
-            segments: Arc::new(segments.iter().map(|s| Arc::new(s.clone())).collect()),
+            segments: Arc::new(segments.clone()),
             tombstones: Arc::new(tombstones.clone()),
         })));
         Ok(Self {
@@ -471,14 +472,13 @@ impl<S: Store> SegmentedStore<S> {
     }
 
     /// Rebuild the published snapshot from the current segments + tombstones. Called
-    /// only at the checkpoint (commit point), so it stays off the per-write ingest
-    /// path. Clones the segment data into the new view; since it runs per checkpoint
-    /// (not per write), the cost is amortized over a whole commit interval.
+    /// only at the checkpoint (commit point). Segments are held as `Arc`, so this
+    /// shares them by refcount (no data clone) and an *unchanged* segment keeps its
+    /// `Arc` identity across checkpoints -- which lets a consumer cache per-segment
+    /// state (a built index) keyed by that identity and rebuild only new segments.
     fn republish(&self) {
-        let segments: Vec<Arc<S::Segment>> =
-            self.segments.iter().map(|s| Arc::new(s.clone())).collect();
         let state = Arc::new(PubState {
-            segments: Arc::new(segments),
+            segments: Arc::new(self.segments.clone()),
             tombstones: Arc::new(self.tombstones.clone()),
         });
         *self.published.write().unwrap() = state;
@@ -556,7 +556,7 @@ impl<S: Store> SegmentedStore<S> {
             return;
         }
         let seg = self.store.build_segment(&self.buffer);
-        self.segments.push(seg);
+        self.segments.push(Arc::new(seg));
         self.buffer.clear();
     }
 
@@ -575,14 +575,15 @@ impl<S: Store> SegmentedStore<S> {
         // Nothing to do for 0/1 segments with no tombstones to purge.
         if before > 1 || (before == 1 && !self.tombstones.is_empty()) {
             let tombstones = std::mem::take(&mut self.tombstones);
+            let owned: Vec<S::Segment> = self.segments.iter().map(|a| (**a).clone()).collect();
             let merged = self
                 .store
-                .merge_segments(&self.segments, &|id| !tombstones.contains(id));
+                .merge_segments(&owned, &|id| !tombstones.contains(id));
             stats.merges = 1;
             stats.items_merged = self.store.segment_len(&merged);
             // Drop a fully-tombstoned merge result rather than keep an empty segment.
             self.segments = if stats.items_merged > 0 {
-                vec![merged]
+                vec![Arc::new(merged)]
             } else {
                 vec![]
             };
@@ -665,7 +666,10 @@ impl<S: Store> SegmentedStore<S> {
     /// Merge the segments at `indices` into one (dropping tombstoned ids), replacing
     /// them in place with the single result. Returns the merged item count.
     fn merge_group(&mut self, indices: Vec<usize>) -> usize {
-        let segs: Vec<S::Segment> = indices.iter().map(|&i| self.segments[i].clone()).collect();
+        let segs: Vec<S::Segment> = indices
+            .iter()
+            .map(|&i| (*self.segments[i]).clone())
+            .collect();
         let merged = {
             let tombstones = &self.tombstones;
             self.store
@@ -685,7 +689,7 @@ impl<S: Store> SegmentedStore<S> {
             .map(|(_, seg)| seg)
             .collect();
         if n > 0 {
-            self.segments.push(merged);
+            self.segments.push(Arc::new(merged));
         }
         n
     }
@@ -872,7 +876,7 @@ impl<S: Store> SegmentedStore<S> {
         self.flush_buffer();
         let new_epoch = self.epoch + 1;
         let snap = Snapshot {
-            segments: self.segments.clone(),
+            segments: self.segments.iter().map(|a| (**a).clone()).collect(),
             tombstones: self.tombstones.iter().cloned().collect::<Vec<_>>(),
         };
         let ckpt = CheckpointFile::new(self.dir.clone());
@@ -895,9 +899,13 @@ impl<S: Store> SegmentedStore<S> {
         Ok(())
     }
 
-    /// The immutable segments, oldest first. Query these plus [`Self::buffer`],
-    /// filtering with [`Self::is_live`].
-    pub fn segments(&self) -> &[S::Segment] {
+    /// The immutable segments, oldest first (each derefs to `S::Segment`). Query
+    /// these plus [`Self::buffer`], filtering with [`Self::is_live`]. Segments are
+    /// `Arc`-shared: an unchanged segment keeps its identity across mutations, so a
+    /// consumer can cache per-segment state keyed by `Arc::as_ptr` and rebuild only
+    /// new segments. For a consistent view while another thread mutates, use a
+    /// [`Reader`] / [`View`] instead.
+    pub fn segments(&self) -> &[Arc<S::Segment>] {
         &self.segments
     }
 
@@ -1064,7 +1072,7 @@ mod tests {
     fn live_set(s: &SegmentedStore<Kv>) -> Vec<(u32, String)> {
         let mut out: Vec<(u32, String)> = Vec::new();
         for seg in s.segments() {
-            for (id, it) in seg {
+            for (id, it) in seg.iter() {
                 if s.is_live(id) {
                     out.push((*id, it.clone()));
                 }
@@ -2094,6 +2102,41 @@ mod tests {
             reader.view().segment_count(),
             1,
             "a fresh view sees the compacted state"
+        );
+    }
+
+    #[test]
+    fn unchanged_segments_keep_arc_identity_across_checkpoints() {
+        // The point of Arc-internal segments: an unchanged segment keeps its Arc
+        // identity across mutations, so a consumer can cache per-segment state keyed
+        // by it and rebuild only new segments.
+        let mut s = SegmentedStore::open(MemoryDirectory::arc(), Kv, 2).unwrap();
+        for i in 0..6u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 3 segments
+        }
+        s.checkpoint().unwrap();
+        let r = s.reader();
+        let ptrs1: Vec<*const _> = r.view().segments().iter().map(Arc::as_ptr).collect();
+        assert_eq!(ptrs1.len(), 3);
+
+        // A no-op checkpoint must keep every segment's identity.
+        s.checkpoint().unwrap();
+        let ptrs2: Vec<*const _> = r.view().segments().iter().map(Arc::as_ptr).collect();
+        assert_eq!(
+            ptrs1, ptrs2,
+            "a no-op checkpoint keeps all segment identities"
+        );
+
+        // Sealing a new segment leaves the originals' identities intact.
+        s.add(10, "x".into()).unwrap();
+        s.add(11, "y".into()).unwrap(); // seals a 4th segment
+        s.checkpoint().unwrap();
+        let ptrs3: Vec<*const _> = r.view().segments().iter().map(Arc::as_ptr).collect();
+        assert_eq!(ptrs3.len(), 4);
+        assert_eq!(
+            &ptrs3[..3],
+            &ptrs1[..],
+            "the original segments keep identity; only the new one is fresh"
         );
     }
 

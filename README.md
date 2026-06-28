@@ -27,10 +27,10 @@ impl Store for Kv {
     }
     fn merge_segments(
         &self,
-        segs: &[Vec<(u32, String)>],
+        segs: &[&Vec<(u32, String)>],
         live: &dyn Fn(&u32) -> bool,
     ) -> Vec<(u32, String)> {
-        segs.iter().flatten().filter(|(id, _)| live(id)).cloned().collect()
+        segs.iter().flat_map(|s| s.iter()).filter(|(id, _)| live(id)).cloned().collect()
     }
     fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize { seg.len() }
 }

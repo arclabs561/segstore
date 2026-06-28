@@ -38,11 +38,11 @@ impl Store for VectorIndex {
 
     fn merge_segments(
         &self,
-        segs: &[Vec<(u32, Vec<f32>)>],
+        segs: &[&Vec<(u32, Vec<f32>)>],
         live: &dyn Fn(&u32) -> bool,
     ) -> Vec<(u32, Vec<f32>)> {
         segs.iter()
-            .flatten()
+            .flat_map(|s| s.iter())
             .filter(|(id, _)| live(id))
             .cloned()
             .collect()

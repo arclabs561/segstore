@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The 0.x series is
 unstable: minor bumps may break the public API and the on-disk format.
 
+## [Unreleased]
+
+### Changed
+
+- `checkpoint()` (and every `compact*` / `reclaim_tombstones`, which all checkpoint)
+  no longer deep-clones the whole segment set before serializing it; it borrows the
+  `Arc`-held segments in place. Wire-identical on disk, so no format change; removes a
+  full-dataset copy from every checkpoint.
+
+### Breaking
+
+- `Store::merge_segments` now takes `segments: &[&Self::Segment]` (was `&[Self::Segment]`),
+  so `segstore` passes its `Arc`-held segments to the consumer's merge without cloning the
+  payloads (it previously deep-cloned every merged segment on each compaction to satisfy
+  the owned-slice signature). Migration: a `segs.iter().flatten()...` body becomes
+  `segs.iter().flat_map(|s| s.iter())...`; the yielded item type and merge semantics are
+  unchanged.
+
 ## [0.2.0] - 2026-06-26
 
 ### Added

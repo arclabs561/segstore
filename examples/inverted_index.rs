@@ -46,11 +46,11 @@ impl Store for InvertedIndex {
 
     fn merge_segments(
         &self,
-        segs: &[BTreeMap<String, Vec<u32>>],
+        segs: &[&BTreeMap<String, Vec<u32>>],
         live: &dyn Fn(&u32) -> bool,
     ) -> BTreeMap<String, Vec<u32>> {
         let mut out: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-        for seg in segs {
+        for &seg in segs {
             for (term, ids) in seg {
                 let postings = out.entry(term.clone()).or_default();
                 postings.extend(ids.iter().copied().filter(|id| live(id)));

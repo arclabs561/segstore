@@ -41,10 +41,10 @@
 //!     }
 //!     fn merge_segments(
 //!         &self,
-//!         segs: &[Vec<(u32, String)>],
+//!         segs: &[&Vec<(u32, String)>],
 //!         live: &dyn Fn(&u32) -> bool,
 //!     ) -> Vec<(u32, String)> {
-//!         segs.iter().flatten().filter(|(id, _)| live(id)).cloned().collect()
+//!         segs.iter().flat_map(|s| s.iter()).filter(|(id, _)| live(id)).cloned().collect()
 //!     }
 //!     fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize { seg.len() }
 //! }
@@ -222,9 +222,12 @@ pub trait Store {
 
     /// Merge `segments` into one during compaction, keeping only ids for which
     /// `live(id)` is true (i.e. dropping tombstoned ids).
+    ///
+    /// Segments arrive by reference (`&[&Self::Segment]`) so `segstore` can pass
+    /// its `Arc`-held segments straight through without cloning the payloads.
     fn merge_segments(
         &self,
-        segments: &[Self::Segment],
+        segments: &[&Self::Segment],
         live: &dyn Fn(&Self::Id) -> bool,
     ) -> Self::Segment;
 
@@ -593,10 +596,12 @@ impl<S: Store> SegmentedStore<S> {
         // Nothing to do for 0/1 segments with no tombstones to purge.
         if before > 1 || (before == 1 && !self.tombstones.is_empty()) {
             let tombstones = std::mem::take(&mut self.tombstones);
-            let owned: Vec<S::Segment> = self.segments.iter().map(|a| (**a).clone()).collect();
+            // Borrow the Arc-held segments rather than cloning their payloads to
+            // satisfy merge_segments (&[&Segment]); the merge reads them in place.
+            let refs: Vec<&S::Segment> = self.segments.iter().map(|a| &**a).collect();
             let merged = self
                 .store
-                .merge_segments(&owned, &|id| !tombstones.contains(id));
+                .merge_segments(&refs, &|id| !tombstones.contains(id));
             stats.merges = 1;
             stats.items_merged = self.store.segment_len(&merged);
             // Drop a fully-tombstoned merge result rather than keep an empty segment.
@@ -684,10 +689,7 @@ impl<S: Store> SegmentedStore<S> {
     /// Merge the segments at `indices` into one (dropping tombstoned ids), replacing
     /// them in place with the single result. Returns the merged item count.
     fn merge_group(&mut self, indices: Vec<usize>) -> usize {
-        let segs: Vec<S::Segment> = indices
-            .iter()
-            .map(|&i| (*self.segments[i]).clone())
-            .collect();
+        let segs: Vec<&S::Segment> = indices.iter().map(|&i| &*self.segments[i]).collect();
         let merged = {
             let tombstones = &self.tombstones;
             self.store
@@ -988,11 +990,11 @@ mod tests {
         }
         fn merge_segments(
             &self,
-            segs: &[Vec<(u32, String)>],
+            segs: &[&Vec<(u32, String)>],
             live: &dyn Fn(&u32) -> bool,
         ) -> Vec<(u32, String)> {
             segs.iter()
-                .flatten()
+                .flat_map(|s| s.iter())
                 .filter(|(id, _)| live(id))
                 .cloned()
                 .collect()
@@ -1016,11 +1018,11 @@ mod tests {
         }
         fn merge_segments(
             &self,
-            segs: &[Vec<(u32, String)>],
+            segs: &[&Vec<(u32, String)>],
             live: &dyn Fn(&u32) -> bool,
         ) -> Vec<(u32, String)> {
             segs.iter()
-                .flatten()
+                .flat_map(|s| s.iter())
                 .filter(|(id, _)| live(id))
                 .cloned()
                 .collect()

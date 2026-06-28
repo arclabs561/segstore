@@ -19,11 +19,11 @@ impl Store for Kv {
     }
     fn merge_segments(
         &self,
-        segs: &[Vec<(u32, String)>],
+        segs: &[&Vec<(u32, String)>],
         live: &dyn Fn(&u32) -> bool,
     ) -> Vec<(u32, String)> {
         segs.iter()
-            .flatten()
+            .flat_map(|s| s.iter())
             .filter(|(id, _)| live(id))
             .cloned()
             .collect()

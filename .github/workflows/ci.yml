@@ -45,6 +45,12 @@ jobs:
   # still build against the current API and survive a short adversarial burst.
   fuzz-smoke:
     runs-on: ubuntu-latest
+    # cargo-fuzz defaults to a musl (statically-linked-libc) target on this
+    # runner, and ASAN refuses to link against static libc; -crt-static lets the
+    # sanitizer link. The explicit --target below also pins gnu over the musl
+    # default so the sanitizer is even attempted.
+    env:
+      RUSTFLAGS: "-C target-feature=-crt-static"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -58,5 +64,6 @@ jobs:
       - name: Fuzz each target (60s)
         run: |
           for t in ops recover; do
-            cargo +nightly fuzz run "$t" -- -max_total_time=60 -max_len=4096
+            cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
+              -max_total_time=60 -max_len=4096
           done

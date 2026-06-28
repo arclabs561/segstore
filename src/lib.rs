@@ -258,10 +258,28 @@ enum Op<Id, Item> {
 
 /// The persisted checkpoint snapshot (segments + tombstones; the buffer is
 /// always flushed before a checkpoint, so it is never part of the snapshot).
+/// This owned form is the *read* side (recovery decodes into it).
 #[derive(Serialize, Deserialize)]
 struct Snapshot<Id, Seg> {
     segments: Vec<Seg>,
     tombstones: Vec<Id>,
+}
+
+/// Borrowing view of the snapshot for *writing* a checkpoint. Serializes the
+/// segments and tombstones in place, so a checkpoint never first deep-clones the
+/// entire dataset into owned `Vec`s (the segments are already `Arc`-held; the
+/// old `(**a).clone()` copied every payload byte on every checkpoint, a second
+/// full pass on top of serialization).
+///
+/// Wire-identical to [`Snapshot`]: postcard encodes a struct as its fields in
+/// order, a `&[&Seg]` as the same sequence as a `Vec<Seg>`, and a `&[&Id]` as
+/// the same sequence as a `Vec<Id>`. So a checkpoint written through this reads
+/// back as `Snapshot` with no format change. The recovery round-trip tests cover
+/// the equivalence.
+#[derive(Serialize)]
+struct SnapshotRef<'a, Id, Seg> {
+    segments: &'a [&'a Seg],
+    tombstones: &'a [&'a Id],
 }
 
 /// The reader-visible published state: the segments and tombstones as of the last
@@ -875,9 +893,14 @@ impl<S: Store> SegmentedStore<S> {
     pub fn checkpoint(&mut self) -> PersistenceResult<()> {
         self.flush_buffer();
         let new_epoch = self.epoch + 1;
-        let snap = Snapshot {
-            segments: self.segments.iter().map(|a| (**a).clone()).collect(),
-            tombstones: self.tombstones.iter().cloned().collect::<Vec<_>>(),
+        // Borrow segments + tombstones in place rather than deep-cloning the
+        // whole dataset into owned `Vec`s before serializing (these collects are
+        // O(segment count) pointers, not O(payload bytes)).
+        let seg_refs: Vec<&S::Segment> = self.segments.iter().map(|a| &**a).collect();
+        let tomb_refs: Vec<&S::Id> = self.tombstones.iter().collect();
+        let snap = SnapshotRef {
+            segments: &seg_refs,
+            tombstones: &tomb_refs,
         };
         let ckpt = CheckpointFile::new(self.dir.clone());
         // The checkpoint publishes atomically (atomic_write + CRC). On a

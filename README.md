@@ -46,13 +46,16 @@ assert!(s.is_live(&1) && !s.is_live(&2));
 ## Durability
 
 In-memory or on-disk via `durability`. Each `add`/`delete` is logged to a
-write-ahead log before it takes effect; a checkpoint snapshots the segments and
-tombstones and publishes atomically (CRC-checked, with an fsync barrier on a
-filesystem backend). The WAL is rotated per checkpoint (a new epoch-suffixed log
-is started and the old one deleted), so the log never grows past one checkpoint
-interval, and recovery replays only the current epoch's WAL. `SyncPolicy::Fsync`
-(via `open_with_options`) syncs every WAL record to stable storage; the default
-flushes to the OS without a per-op fsync.
+write-ahead log before it takes effect. A checkpoint writes each new segment to
+its own file and atomically publishes a manifest (CRC-checked, with an fsync
+barrier on a filesystem backend) naming the current segments and tombstones, then
+rotates the WAL (a new epoch-suffixed log is started and the old one deleted) so
+the log never grows past one checkpoint interval. Because only new segments are
+written, a checkpoint is O(new data), not O(total): the Lucene `segments_N` /
+RocksDB MANIFEST model. Recovery loads the manifest's segment files and replays
+only the current epoch's WAL. `SyncPolicy::Fsync` (via `open_with_options`) syncs
+every WAL record to stable storage; the default flushes to the OS without a
+per-op fsync.
 
 ## Compaction
 

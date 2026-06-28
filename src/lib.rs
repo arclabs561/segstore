@@ -59,14 +59,26 @@
 //!
 //! # Durability
 //!
-//! The WAL is rotated by epoch: a checkpoint snapshots the segments + tombstones
-//! durably, then a fresh WAL generation (`segstore.wal.<epoch>`) is started and
-//! the old one deleted, so the log never grows past one checkpoint interval. The
-//! checkpoint records the epoch it covers; recovery replays only that epoch's
-//! WAL, so a stale WAL left by a crash mid-rotation is simply never read (no
-//! duplicates, no loss). Checkpoints publish atomically (via
-//! `Directory::atomic_write`, CRC-checked), and on a filesystem backend also
-//! pass a power-loss barrier (fsync of the file and parent dir).
+//! A checkpoint is the commit point. It persists each new segment to its own
+//! `segstore.seg.<id>` file (written once, never rewritten), then atomically
+//! writes a small manifest (`segstore.manifest`, CRC-checked) naming the current
+//! segment files + tombstones, then rotates the WAL: a fresh generation
+//! (`segstore.wal.<epoch>`) is started and the old one deleted, so the log never
+//! grows past one checkpoint interval. Because only *new* segments are written, a
+//! checkpoint is O(new data), not O(total): the Lucene `segments_N` / RocksDB
+//! MANIFEST model. The manifest records the epoch it covers; recovery loads the
+//! named segment files and replays only that epoch's WAL.
+//!
+//! The write order makes every crash window safe: new segment files are durable
+//! before the manifest names them, and superseded segment files are GC'd only
+//! after the new manifest is durable. A crash before the manifest leaves orphan
+//! segment files the next open never reads and garbage-collects; a crash after it
+//! leaves the old files as the orphans, GC'd the same way. The WAL, not the
+//! segment files, is the durability backbone: an `add`/`delete` is durable once
+//! its WAL record is, so a partial checkpoint never loses an acknowledged write
+//! (recovery replays the WAL onto the last good manifest). On a filesystem backend
+//! each segment file and the manifest pass a power-loss barrier (fsync of the file
+//! and parent dir); in-memory backends publish atomically without one.
 //!
 //! [`SyncPolicy`] chooses the WAL write durability: the default [`SyncPolicy::Flush`]
 //! is a visibility boundary (userspace -> OS), while [`SyncPolicy::Fsync`] syncs
@@ -80,11 +92,12 @@
 //! is never decoded as garbage, but best-effort read stops at it and drops the rest.
 //! Media-rot detection (a strict "fail on any corruption" mode) is out of scope for
 //! this crash-consistency WAL; a consumer needing it should use checksummed storage.
+//! A CRC-corrupt manifest or segment file is a hard error on open, never misread.
 //!
-//! On-disk format note: segstore 0.2 changed the WAL layout (epoch-suffixed
-//! files, with the epoch recorded in the checkpoint) from 0.1's single
-//! unsuffixed `segstore.wal`. A 0.1 store is detected and rejected with a clear
-//! error rather than misread.
+//! On-disk format note: 0.3 replaced 0.2's single monolithic `segstore.ckpt`
+//! checkpoint blob with the manifest + per-segment-file layout above. A 0.1
+//! unsuffixed `segstore.wal` and a 0.2 `segstore.ckpt` (with no manifest) are each
+//! detected and rejected with a clear error rather than misread.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -99,13 +112,26 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// Prefix for epoch-suffixed WAL files (`segstore.wal.<epoch>`).
 const WAL_PREFIX: &str = "segstore.wal.";
 /// The single unsuffixed WAL of the 0.1 on-disk format; its presence flags a
-/// store written by segstore 0.1, which 0.2 cannot read.
+/// store written by segstore 0.1, which later formats cannot read.
 const LEGACY_WAL_PATH: &str = "segstore.wal";
-const CKPT_PATH: &str = "segstore.ckpt";
+/// The monolithic checkpoint blob of the 0.2 on-disk format; its presence with no
+/// manifest flags a 0.2 store, which the 0.3 manifest format cannot read.
+const LEGACY_CKPT_PATH: &str = "segstore.ckpt";
+/// The 0.3 checkpoint commit point: a small manifest naming the current segment
+/// files + tombstones (see the module-level Durability docs).
+const MANIFEST_PATH: &str = "segstore.manifest";
+/// Prefix for per-segment files (`segstore.seg.<id>`); each holds one immutable
+/// segment, written once and never rewritten.
+const SEG_PREFIX: &str = "segstore.seg.";
 
 /// The WAL file path for a given epoch.
 fn wal_path(epoch: u64) -> String {
     format!("{WAL_PREFIX}{epoch}")
+}
+
+/// The file path for the segment with the given id.
+fn seg_path(id: u64) -> String {
+    format!("{SEG_PREFIX}{id}")
 }
 
 /// How durable each WAL write is before [`SegmentedStore::add`] / [`SegmentedStore::delete`]
@@ -259,29 +285,26 @@ enum Op<Id, Item> {
     Delete(Id),
 }
 
-/// The persisted checkpoint snapshot (segments + tombstones; the buffer is
-/// always flushed before a checkpoint, so it is never part of the snapshot).
-/// This owned form is the *read* side (recovery decodes into it).
-#[derive(Serialize, Deserialize)]
-struct Snapshot<Id, Seg> {
-    segments: Vec<Seg>,
+/// The checkpoint manifest: the commit point of the on-disk state. It names the
+/// current segment files by id and carries the tombstone set; the segments
+/// themselves live in `segstore.seg.<id>` files written once and never rewritten,
+/// so a checkpoint writes only the *new* segments plus this small manifest
+/// (O(delta), not O(total)). The epoch lives in the [`CheckpointFile`] header,
+/// not the body. This owned form is the *read* side (recovery decodes into it).
+#[derive(Deserialize)]
+struct Manifest<Id> {
+    next_seg_id: u64,
+    segment_ids: Vec<u64>,
     tombstones: Vec<Id>,
 }
 
-/// Borrowing view of the snapshot for *writing* a checkpoint. Serializes the
-/// segments and tombstones in place, so a checkpoint never first deep-clones the
-/// entire dataset into owned `Vec`s (the segments are already `Arc`-held; the
-/// old `(**a).clone()` copied every payload byte on every checkpoint, a second
-/// full pass on top of serialization).
-///
-/// Wire-identical to [`Snapshot`]: postcard encodes a struct as its fields in
-/// order, a `&[&Seg]` as the same sequence as a `Vec<Seg>`, and a `&[&Id]` as
-/// the same sequence as a `Vec<Id>`. So a checkpoint written through this reads
-/// back as `Snapshot` with no format change. The recovery round-trip tests cover
-/// the equivalence.
+/// Borrowing view of the manifest for *writing*: serializes the ids + tombstones
+/// in place. Wire-identical to [`Manifest`] (postcard encodes a struct as its
+/// fields in order, and a `&[&Id]` as the same sequence as a `Vec<Id>`).
 #[derive(Serialize)]
-struct SnapshotRef<'a, Id, Seg> {
-    segments: &'a [&'a Seg],
+struct ManifestRef<'a, Id> {
+    next_seg_id: u64,
+    segment_ids: &'a [u64],
     tombstones: &'a [&'a Id],
 }
 
@@ -375,6 +398,16 @@ pub struct SegmentedStore<S: Store> {
     tiering: TierConfig,
     /// Whether `add` auto-runs `compact_tiers` when a bucket is eligible.
     auto_compact: bool,
+    /// The persisted id of each in-memory segment, parallel to `segments` and kept
+    /// in lockstep through every segment mutation. The id names the segment's
+    /// `segstore.seg.<id>` file.
+    segment_ids: Vec<u64>,
+    /// Monotonic source of new segment ids, persisted in the manifest so an id is
+    /// never reused after its `seg.<id>` file is GC'd.
+    next_seg_id: u64,
+    /// Ids whose `segstore.seg.<id>` file is durably on disk, so a checkpoint can
+    /// skip rewriting an unchanged segment.
+    persisted_ids: HashSet<u64>,
 }
 
 impl<S: Store> SegmentedStore<S> {
@@ -407,33 +440,52 @@ impl<S: Store> SegmentedStore<S> {
             tiering,
             auto_compact,
         } = opts;
-        if sync == SyncPolicy::Fsync && dir.file_path(CKPT_PATH).is_none() {
+        if sync == SyncPolicy::Fsync && dir.file_path(MANIFEST_PATH).is_none() {
             return Err(PersistenceError::InvalidConfig(
                 "SyncPolicy::Fsync requires a filesystem-backed Directory".into(),
             ));
         }
-        // A 0.1 store wrote a single unsuffixed WAL; 0.2 changed the format.
+        // A 0.1 store wrote a single unsuffixed WAL; later formats are epoch-suffixed.
         // Reject it explicitly rather than misread its ops as an epoch.
         if dir.exists(LEGACY_WAL_PATH) {
             return Err(PersistenceError::InvalidConfig(
-                "segstore 0.1 on-disk store detected (unsuffixed segstore.wal); the 0.2 \
+                "segstore 0.1 on-disk store detected (unsuffixed segstore.wal); the \
                  on-disk format is epoch-suffixed and cannot read it"
                     .into(),
             ));
         }
+        // A 0.2 store wrote one monolithic segstore.ckpt blob; 0.3 uses a manifest
+        // + per-segment files. A ckpt with no manifest is a 0.2 store; reject it
+        // rather than ignore the data it holds.
+        if dir.exists(LEGACY_CKPT_PATH) && !dir.exists(MANIFEST_PATH) {
+            return Err(PersistenceError::InvalidConfig(
+                "segstore 0.2 on-disk store detected (monolithic segstore.ckpt); the 0.3 \
+                 on-disk format is a manifest + per-segment files and cannot read it"
+                    .into(),
+            ));
+        }
 
-        // Load the checkpoint snapshot if one exists. The checkpoint records the
-        // WAL epoch it covers; recovery replays only that epoch's WAL.
+        // Load the manifest if one exists. It records the WAL epoch it covers (in
+        // the CheckpointFile header) and names the current segment files; recovery
+        // loads each segment file, then replays only that epoch's WAL.
         let mut segments: Vec<Arc<S::Segment>> = Vec::new();
+        let mut segment_ids: Vec<u64> = Vec::new();
         let mut tombstones: HashSet<S::Id> = HashSet::new();
         let mut epoch = 0u64;
-        if dir.exists(CKPT_PATH) {
+        let mut next_seg_id = 0u64;
+        if dir.exists(MANIFEST_PATH) {
             let ckpt = CheckpointFile::new(dir.clone());
-            let (e, snap): (u64, Snapshot<S::Id, S::Segment>) = ckpt.read_postcard(CKPT_PATH)?;
+            let (e, manifest): (u64, Manifest<S::Id>) = ckpt.read_postcard(MANIFEST_PATH)?;
             epoch = e;
-            segments = snap.segments.into_iter().map(Arc::new).collect();
-            tombstones = snap.tombstones.into_iter().collect();
+            next_seg_id = manifest.next_seg_id;
+            tombstones = manifest.tombstones.into_iter().collect();
+            for id in manifest.segment_ids {
+                let (_, seg): (u64, S::Segment) = ckpt.read_postcard(&seg_path(id))?;
+                segments.push(Arc::new(seg));
+                segment_ids.push(id);
+            }
         }
+        let persisted_ids: HashSet<u64> = segment_ids.iter().copied().collect();
 
         // Replay the current epoch's WAL in full. It holds exactly the ops since
         // the checkpoint, so every record is applied (no skip offset).
@@ -448,8 +500,10 @@ impl<S: Store> SegmentedStore<S> {
             }
         }
 
-        // Best-effort GC of stale WAL generations a crash may have left behind
-        // (any `segstore.wal.<k>` with k != epoch is superseded by the checkpoint).
+        // Best-effort GC of crash leftovers: stale WAL generations (any
+        // `segstore.wal.<k>` with k != epoch is superseded by the manifest) and
+        // orphan segment files (any `segstore.seg.<k>` the manifest does not name,
+        // left by a crash between a segment write and the manifest write).
         if let Ok(names) = dir.list_dir("") {
             for name in names {
                 if let Some(k) = name
@@ -457,6 +511,13 @@ impl<S: Store> SegmentedStore<S> {
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     if k != epoch {
+                        let _ = dir.delete(&name);
+                    }
+                } else if let Some(k) = name
+                    .strip_prefix(SEG_PREFIX)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    if !persisted_ids.contains(&k) {
                         let _ = dir.delete(&name);
                     }
                 }
@@ -473,9 +534,12 @@ impl<S: Store> SegmentedStore<S> {
             dir,
             buffer,
             segments,
+            segment_ids,
             tombstones,
             wal,
             epoch,
+            next_seg_id,
+            persisted_ids,
             sync,
             flush_threshold,
             tiering,
@@ -577,8 +641,36 @@ impl<S: Store> SegmentedStore<S> {
             return;
         }
         let seg = self.store.build_segment(&self.buffer);
+        let id = self.alloc_id();
         self.segments.push(Arc::new(seg));
+        self.segment_ids.push(id);
         self.buffer.clear();
+    }
+
+    /// Allocate a fresh, never-reused segment id.
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_seg_id;
+        self.next_seg_id += 1;
+        id
+    }
+
+    /// Delete every `segstore.seg.<k>` file whose id is not in `keep`, and forget
+    /// those ids from `persisted_ids`. Called only after a manifest is durable, so
+    /// a crash mid-GC just leaves orphans that the next open re-GCs.
+    fn gc_orphan_segments(&mut self, keep: &HashSet<u64>) {
+        self.persisted_ids.retain(|id| keep.contains(id));
+        if let Ok(names) = self.dir.list_dir("") {
+            for name in names {
+                if let Some(k) = name
+                    .strip_prefix(SEG_PREFIX)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    if !keep.contains(&k) {
+                        let _ = self.dir.delete(&name);
+                    }
+                }
+            }
+        }
     }
 
     /// Merge ALL segments into one, dropping tombstoned ids and purging the
@@ -605,11 +697,14 @@ impl<S: Store> SegmentedStore<S> {
             stats.merges = 1;
             stats.items_merged = self.store.segment_len(&merged);
             // Drop a fully-tombstoned merge result rather than keep an empty segment.
-            self.segments = if stats.items_merged > 0 {
-                vec![Arc::new(merged)]
+            if stats.items_merged > 0 {
+                let id = self.alloc_id();
+                self.segments = vec![Arc::new(merged)];
+                self.segment_ids = vec![id];
             } else {
-                vec![]
-            };
+                self.segments = vec![];
+                self.segment_ids = vec![];
+            }
         }
         // After a full compaction no segment references a tombstoned id, so the set
         // is purged even if there was nothing to merge (stale tombstones for ids that
@@ -708,8 +803,18 @@ impl<S: Store> SegmentedStore<S> {
             .filter(|(i, _)| merged_idx.binary_search(i).is_err())
             .map(|(_, seg)| seg)
             .collect();
+        // Keep segment_ids aligned with segments: drop the same merged indices.
+        let old_ids = std::mem::take(&mut self.segment_ids);
+        self.segment_ids = old_ids
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| merged_idx.binary_search(i).is_err())
+            .map(|(_, id)| id)
+            .collect();
         if n > 0 {
+            let id = self.alloc_id();
             self.segments.push(Arc::new(merged));
+            self.segment_ids.push(id);
         }
         n
     }
@@ -894,32 +999,61 @@ impl<S: Store> SegmentedStore<S> {
     /// GC'd on the next open.
     pub fn checkpoint(&mut self) -> PersistenceResult<()> {
         self.flush_buffer();
+        debug_assert_eq!(self.segments.len(), self.segment_ids.len());
         let new_epoch = self.epoch + 1;
-        // Borrow segments + tombstones in place rather than deep-cloning the
-        // whole dataset into owned `Vec`s before serializing (these collects are
-        // O(segment count) pointers, not O(payload bytes)).
-        let seg_refs: Vec<&S::Segment> = self.segments.iter().map(|a| &**a).collect();
-        let tomb_refs: Vec<&S::Id> = self.tombstones.iter().collect();
-        let snap = SnapshotRef {
-            segments: &seg_refs,
-            tombstones: &tomb_refs,
-        };
+        // On a filesystem backend, pass a power-loss barrier (fsync); in-memory
+        // backends have no barrier and fall back to the atomic-only write.
+        let durable = self.dir.file_path(MANIFEST_PATH).is_some();
         let ckpt = CheckpointFile::new(self.dir.clone());
-        // The checkpoint publishes atomically (atomic_write + CRC). On a
-        // filesystem backend, also pass a power-loss barrier; in-memory backends
-        // have no such barrier, so fall back to the atomic-only write.
-        if self.dir.file_path(CKPT_PATH).is_some() {
-            ckpt.write_postcard_durable(CKPT_PATH, new_epoch, &snap)?;
-        } else {
-            ckpt.write_postcard(CKPT_PATH, new_epoch, &snap)?;
+
+        // 1. Persist every not-yet-written segment to its own file, durably, BEFORE
+        //    the manifest names it. A crash here leaves an orphan seg file the
+        //    manifest never references (GC'd on open); the old manifest still points
+        //    at the old set, so nothing committed is lost.
+        let to_write: Vec<(usize, u64)> = self
+            .segment_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !self.persisted_ids.contains(id))
+            .map(|(i, &id)| (i, id))
+            .collect();
+        for (idx, id) in to_write {
+            let seg = &*self.segments[idx];
+            if durable {
+                ckpt.write_postcard_durable(&seg_path(id), 0, seg)?;
+            } else {
+                ckpt.write_postcard(&seg_path(id), 0, seg)?;
+            }
+            self.persisted_ids.insert(id);
         }
 
-        // Past the commit point: start the new WAL generation and drop the old.
+        // 2. Write the manifest: the commit point. It records the new epoch and
+        //    names the current segment files, so once it is durable, recovery
+        //    replays only the new (initially empty) WAL; the old WAL is superseded.
+        let tomb_refs: Vec<&S::Id> = self.tombstones.iter().collect();
+        let manifest = ManifestRef {
+            next_seg_id: self.next_seg_id,
+            segment_ids: &self.segment_ids,
+            tombstones: &tomb_refs,
+        };
+        if durable {
+            ckpt.write_postcard_durable(MANIFEST_PATH, new_epoch, &manifest)?;
+        } else {
+            ckpt.write_postcard(MANIFEST_PATH, new_epoch, &manifest)?;
+        }
+
+        // 3. Past the commit point: start the new WAL generation and drop the old.
         let old_epoch = self.epoch;
         self.wal = RecordLogWriter::new(self.dir.clone(), wal_path(new_epoch));
         self.epoch = new_epoch;
         let _ = self.dir.delete(&wal_path(old_epoch));
-        // Publish the post-compaction segment set to readers (the commit point).
+
+        // 4. GC the segment files the new manifest no longer names (a merge's
+        //    inputs). Safe only now that the manifest is durable.
+        let keep: HashSet<u64> = self.segment_ids.iter().copied().collect();
+        self.gc_orphan_segments(&keep);
+
+        // 5. Publish the post-checkpoint segment set to readers (the commit point).
         self.republish();
         Ok(())
     }
@@ -1584,18 +1718,18 @@ mod tests {
             s.add(2, "b".into()).unwrap();
             s.checkpoint().unwrap();
         }
-        // Flip a byte in the middle of the checkpoint payload (past the header).
-        let ckpt = root.join(CKPT_PATH);
-        let mut bytes = std::fs::read(&ckpt).unwrap();
+        // Flip a byte in the middle of the manifest payload (past the header).
+        let manifest = root.join(MANIFEST_PATH);
+        let mut bytes = std::fs::read(&manifest).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
-        std::fs::write(&ckpt, &bytes).unwrap();
+        std::fs::write(&manifest, &bytes).unwrap();
 
         let dir = durability::FsDirectory::arc(&root).unwrap();
         let res = SegmentedStore::open(dir, Kv, 2);
         assert!(
             res.is_err(),
-            "a CRC-corrupt checkpoint is an error, not silently misread"
+            "a CRC-corrupt manifest is an error, not silently misread"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1610,12 +1744,165 @@ mod tests {
             s.add(2, "b".into()).unwrap();
             s.checkpoint().unwrap();
         }
-        // A crash mid atomic_write can leave a `<ckpt>.tmp` next to the real file.
-        std::fs::write(root.join(format!("{CKPT_PATH}.tmp")), b"garbage").unwrap();
+        // A crash mid atomic_write can leave a `<manifest>.tmp` next to the real file.
+        std::fs::write(root.join(format!("{MANIFEST_PATH}.tmp")), b"garbage").unwrap();
 
         let dir = durability::FsDirectory::arc(&root).unwrap();
         let s2 = SegmentedStore::open(dir, Kv, 2).unwrap();
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (2, "b".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- manifest format: incremental write, GC, version rejection ----
+
+    /// A `Directory` that records the path of every mutating write (`atomic_write`
+    /// + `create_file`), to assert which files a checkpoint actually rewrites.
+    struct CountDir {
+        inner: Arc<dyn Directory>,
+        writes: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl CountDir {
+        fn wrap(
+            inner: Arc<dyn Directory>,
+        ) -> (Arc<dyn Directory>, Arc<std::sync::Mutex<Vec<String>>>) {
+            let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let dir: Arc<dyn Directory> = Arc::new(CountDir {
+                inner,
+                writes: writes.clone(),
+            });
+            (dir, writes)
+        }
+    }
+    impl Directory for CountDir {
+        fn create_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.writes.lock().unwrap().push(p.to_string());
+            self.inner.create_file(p)
+        }
+        fn atomic_write(&self, p: &str, d: &[u8]) -> PersistenceResult<()> {
+            self.writes.lock().unwrap().push(p.to_string());
+            self.inner.atomic_write(p, d)
+        }
+        fn open_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
+            self.inner.open_file(p)
+        }
+        fn exists(&self, p: &str) -> bool {
+            self.inner.exists(p)
+        }
+        fn delete(&self, p: &str) -> PersistenceResult<()> {
+            self.inner.delete(p)
+        }
+        fn atomic_rename(&self, a: &str, b: &str) -> PersistenceResult<()> {
+            self.inner.atomic_rename(a, b)
+        }
+        fn create_dir_all(&self, p: &str) -> PersistenceResult<()> {
+            self.inner.create_dir_all(p)
+        }
+        fn list_dir(&self, p: &str) -> PersistenceResult<Vec<String>> {
+            self.inner.list_dir(p)
+        }
+        fn append_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.inner.append_file(p)
+        }
+        fn file_path(&self, p: &str) -> Option<std::path::PathBuf> {
+            self.inner.file_path(p)
+        }
+    }
+
+    /// Count the `segstore.seg.*` files currently on disk.
+    fn seg_file_count(dir: &Arc<dyn Directory>) -> usize {
+        dir.list_dir("")
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.starts_with(SEG_PREFIX))
+            .count()
+    }
+
+    #[test]
+    fn checkpoint_writes_only_new_segment_files() {
+        // The point of the manifest format: a checkpoint rewrites only the segments
+        // sealed since the last one, not the whole corpus (O(delta), not O(total)).
+        let (dir, writes) = CountDir::wrap(MemoryDirectory::arc());
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        for i in 0..4u32 {
+            s.add(i, format!("v{i}")).unwrap(); // two sealed segments (ids 0, 1)
+        }
+        s.checkpoint().unwrap(); // writes seg.0, seg.1, manifest
+        writes.lock().unwrap().clear();
+
+        // One more segment, then checkpoint again.
+        s.add(4, "e".into()).unwrap();
+        s.add(5, "f".into()).unwrap(); // seals a third segment (id 2)
+        s.checkpoint().unwrap();
+
+        let w = writes.lock().unwrap();
+        let seg_writes: Vec<&String> = w.iter().filter(|p| p.starts_with(SEG_PREFIX)).collect();
+        assert_eq!(
+            seg_writes.len(),
+            1,
+            "only the one new segment file is rewritten, not the unchanged two: {:?}",
+            *w
+        );
+        assert!(
+            seg_writes[0].ends_with(".2"),
+            "and it is the new segment's file: {:?}",
+            seg_writes
+        );
+    }
+
+    #[test]
+    fn compaction_gcs_superseded_segment_files() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+        for i in 0..8u32 {
+            s.add(i, format!("v{i}")).unwrap(); // four segments
+        }
+        s.checkpoint().unwrap();
+        assert_eq!(seg_file_count(&dir), 4, "one file per segment");
+        s.compact().unwrap(); // merge to one; the four inputs are superseded
+        assert_eq!(s.segment_count(), 1);
+        assert_eq!(
+            seg_file_count(&dir),
+            1,
+            "the merged-away segment files are GC'd; only the result remains"
+        );
+    }
+
+    #[test]
+    fn v02_ckpt_format_is_rejected() {
+        let dir = MemoryDirectory::arc();
+        // Simulate a 0.2 store: a monolithic checkpoint blob, no manifest.
+        dir.atomic_write(LEGACY_CKPT_PATH, b"a 0.2 checkpoint blob")
+            .unwrap();
+        let err = SegmentedStore::open(dir, Kv, 2);
+        assert!(
+            matches!(err, Err(PersistenceError::InvalidConfig(_))),
+            "a 0.2 on-disk store is rejected, not misread"
+        );
+    }
+
+    #[test]
+    fn corrupt_segment_file_is_rejected() {
+        let root = temp_root("corrupt-seg");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+            s.add(1, "aaaaaaaa".into()).unwrap();
+            s.add(2, "bbbbbbbb".into()).unwrap(); // seals segment id 0
+            s.checkpoint().unwrap();
+        }
+        // Corrupt the one segment file (seg.0); recovery must reject, not misread.
+        let seg = root.join(seg_path(0));
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let res = SegmentedStore::open(dir, Kv, 2);
+        assert!(
+            res.is_err(),
+            "a CRC-corrupt segment file is an error, not silently misread"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1694,6 +1981,11 @@ mod tests {
             .filter(|n| n.starts_with(WAL_PREFIX))
             .collect();
         assert!(wals.len() <= 1, "no leaked WAL generations: {wals:?}");
+        assert_eq!(
+            seg_file_count(&mem),
+            0,
+            "no leaked segment files after delete-all + compact"
+        );
     }
     // ---- tombstone reclamation (optional live_len) ----
 

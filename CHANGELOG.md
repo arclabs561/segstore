@@ -9,13 +9,19 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Changed
 
-- `checkpoint()` (and every `compact*` / `reclaim_tombstones`, which all checkpoint)
-  no longer deep-clones the whole segment set before serializing it; it borrows the
-  `Arc`-held segments in place. Wire-identical on disk, so no format change; removes a
-  full-dataset copy from every checkpoint.
+- Incremental checkpoints. A checkpoint now persists each new segment to its own
+  `segstore.seg.<id>` file and atomically publishes a `segstore.manifest` naming the
+  current segment files + tombstones, instead of re-serializing the whole corpus into
+  one blob on every checkpoint. Only newly-sealed segments are written, so a checkpoint
+  is O(new data), not O(total): the Lucene `segments_N` / RocksDB MANIFEST model.
+  Segment files a merge supersedes are garbage-collected after the manifest is durable.
 
 ### Breaking
 
+- On-disk format: 0.3 replaces 0.2's single monolithic `segstore.ckpt` checkpoint blob
+  with the `segstore.manifest` + per-segment `segstore.seg.<id>` layout above. A 0.2
+  store (a `segstore.ckpt` with no manifest) is detected and rejected with a clear error
+  rather than misread.
 - `Store::merge_segments` now takes `segments: &[&Self::Segment]` (was `&[Self::Segment]`),
   so `segstore` passes its `Arc`-held segments to the consumer's merge without cloning the
   payloads (it previously deep-cloned every merged segment on each compaction to satisfy

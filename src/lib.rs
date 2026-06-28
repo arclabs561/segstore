@@ -312,6 +312,7 @@ struct ManifestRef<'a, Id> {
 /// mutation, behind `Arc`s so a [`View`] is a cheap, consistent snapshot.
 struct PubState<S: Store> {
     segments: Arc<Vec<Arc<S::Segment>>>,
+    segment_ids: Arc<Vec<u64>>,
     tombstones: Arc<HashSet<S::Id>>,
 }
 
@@ -326,6 +327,7 @@ struct PubState<S: Store> {
 /// ingest hot path (republishing per write made bulk ingest quadratic).
 pub struct View<S: Store> {
     segments: Arc<Vec<Arc<S::Segment>>>,
+    segment_ids: Arc<Vec<u64>>,
     tombstones: Arc<HashSet<S::Id>>,
 }
 
@@ -334,6 +336,15 @@ impl<S: Store> View<S> {
     /// `S::Segment`), filtering with [`Self::is_live`].
     pub fn segments(&self) -> &[Arc<S::Segment>] {
         &self.segments
+    }
+
+    /// The stable persistence id of each segment in [`Self::segments`], same order.
+    /// Unlike the segment's `Arc` pointer, this id is stable across checkpoints AND
+    /// restarts (it names the segment's `segstore.seg.<id>` file), so a consumer can
+    /// key a *persisted* per-segment built-index cache on it and reload across a
+    /// process restart instead of rebuilding from the raw payload.
+    pub fn segment_ids(&self) -> &[u64] {
+        &self.segment_ids
     }
 
     /// Whether `id` is not tombstoned in this snapshot.
@@ -369,6 +380,7 @@ impl<S: Store> Reader<S> {
         let state = self.published.read().unwrap().clone();
         View {
             segments: state.segments.clone(),
+            segment_ids: state.segment_ids.clone(),
             tombstones: state.tombstones.clone(),
         }
     }
@@ -527,6 +539,7 @@ impl<S: Store> SegmentedStore<S> {
         let wal = RecordLogWriter::new(dir.clone(), live_wal);
         let published = Arc::new(std::sync::RwLock::new(Arc::new(PubState {
             segments: Arc::new(segments.clone()),
+            segment_ids: Arc::new(segment_ids.clone()),
             tombstones: Arc::new(tombstones.clone()),
         })));
         Ok(Self {
@@ -564,6 +577,7 @@ impl<S: Store> SegmentedStore<S> {
     fn republish(&self) {
         let state = Arc::new(PubState {
             segments: Arc::new(self.segments.clone()),
+            segment_ids: Arc::new(self.segment_ids.clone()),
             tombstones: Arc::new(self.tombstones.clone()),
         });
         *self.published.write().unwrap() = state;
@@ -1063,9 +1077,20 @@ impl<S: Store> SegmentedStore<S> {
     /// `Arc`-shared: an unchanged segment keeps its identity across mutations, so a
     /// consumer can cache per-segment state keyed by `Arc::as_ptr` and rebuild only
     /// new segments. For a consistent view while another thread mutates, use a
-    /// [`Reader`] / [`View`] instead.
+    /// [`Reader`] / [`View`] instead. For a cache key that *also* survives a restart,
+    /// use [`Self::segment_ids`].
     pub fn segments(&self) -> &[Arc<S::Segment>] {
         &self.segments
+    }
+
+    /// The stable persistence id of each segment in [`Self::segments`], same order.
+    /// Unlike the segment's `Arc` pointer (stable only within one process), this id
+    /// names the segment's `segstore.seg.<id>` file and is stable across checkpoints
+    /// *and* restarts, so a consumer can key a *persisted* per-segment built-index
+    /// cache on it and reload across a process restart instead of rebuilding from the
+    /// raw payload. An id is never reused after its segment is compacted away.
+    pub fn segment_ids(&self) -> &[u64] {
+        &self.segment_ids
     }
 
     /// Live adds not yet flushed into a segment.
@@ -2458,6 +2483,50 @@ mod tests {
     }
 
     #[test]
+    fn segment_ids_align_and_are_stable_across_checkpoint_and_reopen() {
+        // The stable-id contract the persist-index hook rests on: ids align 1:1 with
+        // segments, an unchanged segment keeps its id (so a persisted-index cache key
+        // does not move), and ids survive a restart (unlike the Arc pointer).
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+        for i in 0..6u32 {
+            s.add(i, format!("v{i}")).unwrap(); // 3 segments
+        }
+        s.checkpoint().unwrap();
+        assert_eq!(s.segment_ids().len(), s.segments().len());
+        assert_eq!(s.segment_ids().len(), 3);
+        let ids0: Vec<u64> = s.segment_ids().to_vec();
+        // The concurrent View exposes the same ids as the writer.
+        assert_eq!(s.reader().view().segment_ids(), &ids0[..]);
+
+        // A no-op checkpoint keeps every id (the cache key must not move on no change).
+        s.checkpoint().unwrap();
+        assert_eq!(s.segment_ids(), &ids0[..], "no-op checkpoint keeps ids");
+
+        // Sealing a new segment keeps the originals' ids and appends a fresh one.
+        s.add(10, "x".into()).unwrap();
+        s.add(11, "y".into()).unwrap(); // seals a 4th segment
+        s.checkpoint().unwrap();
+        assert_eq!(&s.segment_ids()[..3], &ids0[..], "old ids unchanged");
+        assert_eq!(s.segment_ids().len(), 4);
+        assert!(
+            !ids0.contains(&s.segment_ids()[3]),
+            "the new segment got a fresh, never-reused id"
+        );
+
+        // Ids survive a restart: a consumer keying a persisted index cache on these
+        // reloads it instead of rebuilding from the raw payload.
+        let before: Vec<u64> = s.segment_ids().to_vec();
+        drop(s);
+        let s2 = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(
+            s2.segment_ids(),
+            &before[..],
+            "segment ids are stable across a restart (persisted in the manifest)"
+        );
+    }
+
+    #[test]
     fn concurrent_reader_during_writes_stays_consistent() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut s = SegmentedStore::open_with_options(
@@ -2673,6 +2742,9 @@ mod tests {
                 for sz in s.segment_sizes() {
                     prop_assert!(sz <= cfg.max_merged_len);
                 }
+                // segment_ids must stay aligned 1:1 with segments under every op,
+                // including across Reopen (the persist-index cache key invariant).
+                prop_assert_eq!(s.segment_ids().len(), s.segment_count());
             }
             let want: Vec<(u32, String)> = model.into_iter().collect();
             prop_assert_eq!(live_set(&s), want);

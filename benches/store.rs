@@ -159,12 +159,109 @@ fn bench_ingest_fs(c: &mut Criterion) {
     g.finish();
 }
 
+// ---- realistic payload ----
+//
+// The Kv benches above carry a toy (u32, "vN") payload, which understates the
+// cost the borrow-not-clone change removed: with a tiny payload, materializing
+// a segment is dominated by per-String allocation, not bytes copied. A real
+// consumer (sporse: SparseVec, vicinity: Vec<f32>) carries hundreds of bytes
+// per item, where the eliminated full-segment clone is the dominant term.
+// `Blob` models that with a 512-byte value per item.
+
+const BLOB_BYTES: usize = 512;
+
+struct Blob;
+impl Store for Blob {
+    type Id = u32;
+    type Item = Vec<u8>;
+    type Segment = Vec<(u32, Vec<u8>)>;
+    fn build_segment(&self, batch: &[(u32, Vec<u8>)]) -> Vec<(u32, Vec<u8>)> {
+        batch.to_vec()
+    }
+    fn merge_segments(
+        &self,
+        segs: &[&Vec<(u32, Vec<u8>)>],
+        live: &dyn Fn(&u32) -> bool,
+    ) -> Vec<(u32, Vec<u8>)> {
+        segs.iter()
+            .flat_map(|s| s.iter())
+            .filter(|(id, _)| live(id))
+            .cloned()
+            .collect()
+    }
+    fn segment_len(&self, seg: &Vec<(u32, Vec<u8>)>) -> usize {
+        seg.len()
+    }
+}
+
+/// Direct A/B of the materialization the two perf commits changed, on a
+/// consumer-realistic segment set (8 segments x 1000 items x 512 B ~= 4 MB).
+/// `clone` is what `compact()` / `merge_group()` / `checkpoint()` did before
+/// (build a `Vec<Segment>` by deep-cloning every payload); `borrow` is what they
+/// do now (a `Vec<&Segment>` of pointers). Both arms run under identical machine
+/// load, so the *ratio* isolates the eliminated overhead even when the absolute
+/// compaction benches are contention-noisy.
+fn bench_merge_input_materialization(c: &mut Criterion) {
+    use std::sync::Arc;
+    type Seg = Vec<(u32, Vec<u8>)>;
+    let segs: Vec<Arc<Seg>> = (0..8u32)
+        .map(|s| {
+            Arc::new(
+                (0..1000u32)
+                    .map(|i| (s * 1000 + i, vec![0u8; BLOB_BYTES]))
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut g = c.benchmark_group("merge_input_materialization");
+    g.bench_function("clone", |b| {
+        b.iter(|| {
+            let owned: Vec<Seg> = segs.iter().map(|a| (**a).clone()).collect();
+            criterion::black_box(&owned);
+        });
+    });
+    g.bench_function("borrow", |b| {
+        b.iter(|| {
+            let refs: Vec<&Seg> = segs.iter().map(|a| &**a).collect();
+            criterion::black_box(&refs);
+        });
+    });
+    g.finish();
+}
+
+/// Full compaction on the 512-byte payload (8 segments of ~250 items), where the
+/// borrow-not-clone change has its largest relative effect on the whole op.
+fn bench_compact_realistic(c: &mut Criterion) {
+    c.bench_function("compact_full_blob_512B", |b| {
+        b.iter_batched(
+            || {
+                let mut s = SegmentedStore::open_with_options(
+                    MemoryDirectory::arc(),
+                    Blob,
+                    Options::new(256),
+                )
+                .unwrap();
+                for i in 0..2_000u32 {
+                    s.add(i, vec![0u8; BLOB_BYTES]).unwrap();
+                }
+                s
+            },
+            |mut s| {
+                s.compact().unwrap();
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_add,
     bench_compact_tiers,
     bench_full_compact,
     bench_recovery,
-    bench_ingest_fs
+    bench_ingest_fs,
+    bench_merge_input_materialization,
+    bench_compact_realistic
 );
 criterion_main!(benches);

@@ -27,6 +27,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "recover_manifest"
+path = "fuzz_targets/recover_manifest.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the parent crate's build/CI never pulls in the fuzz target
 # (it needs nightly + the libFuzzer sanitizer runtime).
 [workspace]

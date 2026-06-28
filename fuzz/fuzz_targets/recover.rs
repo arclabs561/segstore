@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 
 use arbitrary::Arbitrary;
-use durability::{Directory, MemoryDirectory};
+use durability::MemoryDirectory;
 use libfuzzer_sys::fuzz_target;
 use segstore::{SegmentedStore, Store};
 

@@ -254,6 +254,47 @@ fn bench_compact_realistic(c: &mut Criterion) {
     });
 }
 
+/// Per-op WAL durability cost: the default Flush (userspace -> OS, no fsync) vs
+/// Fsync (fdatasync the WAL file AND its parent dir on every record). On a real
+/// filesystem this exposes the fsync-barrier cost the strong policy pays. The
+/// parent-dir fsync per append is redundant after file creation; this bench is what
+/// shows the win when that redundancy is removed in the durability layer (the gap
+/// should narrow toward `flush`).
+fn bench_sync_policy(c: &mut Criterion) {
+    use durability::FsDirectory;
+    use segstore::SyncPolicy;
+    let mut g = c.benchmark_group("sync_policy_fs_100");
+    let n = 100u32; // Fsync per-op is slow on real disk; keep the count small.
+    let mk = |tag: &str| {
+        let mut p = std::env::temp_dir();
+        p.push(format!("segbench-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    };
+    for (label, sync) in [("flush", SyncPolicy::Flush), ("fsync", SyncPolicy::Fsync)] {
+        g.bench_function(label, |b| {
+            b.iter_batched(
+                || mk(label),
+                |p| {
+                    let opts = Options {
+                        sync,
+                        ..Options::new(256)
+                    };
+                    let mut s =
+                        SegmentedStore::open_with_options(FsDirectory::arc(&p).unwrap(), Kv, opts)
+                            .unwrap();
+                    for i in 0..n {
+                        s.add(i, format!("v{i}")).unwrap();
+                    }
+                    let _ = std::fs::remove_dir_all(&p);
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_add,
@@ -262,6 +303,7 @@ criterion_group!(
     bench_recovery,
     bench_ingest_fs,
     bench_merge_input_materialization,
-    bench_compact_realistic
+    bench_compact_realistic,
+    bench_sync_policy
 );
 criterion_main!(benches);

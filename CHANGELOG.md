@@ -5,6 +5,22 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The 0.x series is
 unstable: minor bumps may break the public API and the on-disk format.
 
+## [Unreleased]
+
+### Added
+
+- Persist-the-built-index hook (so recovery loads a consumer's per-segment index
+  instead of rebuilding it from the raw payload on every restart):
+  - `segment_ids()` (on `SegmentedStore` and `View`): the stable per-segment id,
+    parallel to `segments()`, that names the `segstore.seg.<id>` file and survives a
+    restart (unlike the `Arc` pointer). A consumer keys a persisted index cache on it.
+  - `dir()` and `index_name(id, kind)`: write a built per-segment index into the
+    reserved `segstore.idx.<id>.<kind>` namespace via the store's `Directory`.
+    segstore garbage-collects each sidecar when its segment is compacted away, and
+    sweeps orphans on open, on the same crash-safe schedule as the segment files.
+    The consumer owns the sidecar's encoding (segstore never reads it). No `Store`
+    trait change.
+
 ## [0.3.0] - 2026-06-28
 
 ### Changed

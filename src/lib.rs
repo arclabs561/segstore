@@ -134,6 +134,22 @@ fn seg_path(id: u64) -> String {
     format!("{SEG_PREFIX}{id}")
 }
 
+/// Reserved prefix for consumer-written per-segment index sidecar files
+/// (`segstore.idx.<id>.<kind>`). A consumer persists a built per-segment index
+/// (an HNSW graph, posting lists, ...) here keyed by a stable segment id; segstore
+/// garbage-collects any file in this namespace whose segment id is not in the
+/// current manifest, on the same crash-safe schedule as the segment files. The
+/// consumer owns the file's encoding (segstore never reads it).
+const IDX_PREFIX: &str = "segstore.idx.";
+
+/// The segment id named by an index sidecar file `segstore.idx.<id>.<kind>`, or
+/// `None` if `name` is not in the index namespace.
+fn idx_seg_id(name: &str) -> Option<u64> {
+    name.strip_prefix(IDX_PREFIX)
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
 /// How durable each WAL write is before [`SegmentedStore::add`] / [`SegmentedStore::delete`]
 /// returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +548,11 @@ impl<S: Store> SegmentedStore<S> {
                     if !persisted_ids.contains(&k) {
                         let _ = dir.delete(&name);
                     }
+                } else if let Some(k) = idx_seg_id(&name) {
+                    // Consumer index sidecar whose segment is gone: orphan, GC it.
+                    if !persisted_ids.contains(&k) {
+                        let _ = dir.delete(&name);
+                    }
                 }
             }
         }
@@ -679,6 +700,11 @@ impl<S: Store> SegmentedStore<S> {
                     .strip_prefix(SEG_PREFIX)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
+                    if !keep.contains(&k) {
+                        let _ = self.dir.delete(&name);
+                    }
+                } else if let Some(k) = idx_seg_id(&name) {
+                    // A consumer's index sidecar for a compacted-away segment.
                     if !keep.contains(&k) {
                         let _ = self.dir.delete(&name);
                     }
@@ -1091,6 +1117,25 @@ impl<S: Store> SegmentedStore<S> {
     /// raw payload. An id is never reused after its segment is compacted away.
     pub fn segment_ids(&self) -> &[u64] {
         &self.segment_ids
+    }
+
+    /// The directory this store is backed by, so a consumer can persist a built
+    /// per-segment index alongside the segments. Write the index into the reserved
+    /// sidecar name from [`Self::index_name`], keyed by a stable [`Self::segment_ids`]
+    /// id; segstore garbage-collects it when its segment is compacted away (on the
+    /// same crash-safe schedule as the segment files). A missing or stale sidecar
+    /// means "rebuild from the raw segment." This is the persist-the-built-index
+    /// hook: recovery loads the sidecar instead of rebuilding every consumer index.
+    pub fn dir(&self) -> &Arc<dyn Directory> {
+        &self.dir
+    }
+
+    /// The reserved sidecar file name for a per-segment index of the given `kind`
+    /// (e.g. `"hnsw"`), keyed by a stable [`Self::segment_ids`] id. `kind` must not
+    /// contain `.`. Use with [`Self::dir`] to persist/load a built index that
+    /// segstore GCs in lockstep with the segment.
+    pub fn index_name(&self, id: u64, kind: &str) -> String {
+        format!("{IDX_PREFIX}{id}.{kind}")
     }
 
     /// Live adds not yet flushed into a segment.
@@ -1924,6 +1969,48 @@ mod tests {
             1,
             "the merged-away segment files are GC'd; only the result remains"
         );
+    }
+
+    #[test]
+    fn index_sidecars_are_gced_with_their_segments() {
+        // The persist-index hook: a consumer writes a per-segment index sidecar keyed
+        // by a stable seg id; segstore GCs it when the segment is compacted away, and
+        // sweeps orphans on open, on the same schedule as the segment files.
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+        for i in 0..8u32 {
+            s.add(i, format!("v{i}")).unwrap(); // four segments
+        }
+        s.checkpoint().unwrap();
+        // Simulate the consumer persisting one index sidecar per segment.
+        for &id in s.segment_ids() {
+            dir.atomic_write(&s.index_name(id, "toy"), b"built-index")
+                .unwrap();
+        }
+        let idx_count = |d: &Arc<dyn Directory>| {
+            d.list_dir("")
+                .unwrap()
+                .into_iter()
+                .filter(|n| idx_seg_id(n).is_some())
+                .count()
+        };
+        assert_eq!(idx_count(&dir), 4, "one sidecar per segment");
+
+        // Compaction merges to one segment; the four inputs' sidecars are orphaned.
+        s.compact().unwrap();
+        assert_eq!(s.segment_count(), 1);
+        assert_eq!(
+            idx_count(&dir),
+            0,
+            "sidecars of compacted-away segments are GC'd"
+        );
+
+        // A sidecar for a segment that no longer exists is swept on open.
+        dir.atomic_write(&s.index_name(9999, "toy"), b"orphan")
+            .unwrap();
+        drop(s);
+        let _ = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+        assert_eq!(idx_count(&dir), 0, "orphan sidecar GC'd on open");
     }
 
     #[test]

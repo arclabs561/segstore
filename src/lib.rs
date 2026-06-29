@@ -1302,6 +1302,40 @@ mod tests {
     }
 
     #[test]
+    fn re_add_of_a_live_id_double_lives_there_is_no_replace() {
+        // Liveness is a per-id boolean, and `add` revives an id (clears its
+        // tombstone), so a re-add of an already-live id does NOT supersede the old
+        // copy: both the old and new values stay live. There is no last-write-wins
+        // and no `replace`; a consumer must use unique ids, or compact away the old
+        // copy before re-adding.
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "x".into()).unwrap(); // flush=2 seals [(1,"a"),(2,"x")]
+        s.add(1, "b".into()).unwrap(); // re-add 1: buffered; segment's (1,"a") survives
+        let n_live_1 = live_set(&s).iter().filter(|(id, _)| *id == 1).count();
+        assert_eq!(
+            n_live_1, 2,
+            "a re-add double-lives the id; no last-write-wins"
+        );
+
+        // delete-then-add does NOT supersede either: `add` revives (un-tombstones)
+        // the old copy, so it comes back alongside the new value.
+        s.delete(1).unwrap();
+        s.add(1, "c".into()).unwrap();
+        let live_1: Vec<String> = live_set(&s)
+            .into_iter()
+            .filter(|(id, _)| *id == 1)
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            live_1,
+            vec!["a".to_string(), "c".to_string()],
+            "delete-then-add revived the old value: no replace in the per-id model"
+        );
+    }
+
+    #[test]
     fn compaction_physically_drops_tombstoned_ids() {
         let dir = MemoryDirectory::arc();
         let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();

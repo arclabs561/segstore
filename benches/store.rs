@@ -295,6 +295,33 @@ fn bench_sync_policy(c: &mut Criterion) {
     g.finish();
 }
 
+/// Recovery (reopen) cost on the 512-byte payload, the dimension where zero-copy
+/// would matter: `open` postcard-DECODES every segment file (O(total payload)),
+/// while queries are in-memory and never decode. Contrast the toy `recover` group
+/// (tiny strings) to see decode scale with payload size, not just item count.
+fn bench_recovery_blob(c: &mut Criterion) {
+    let mut g = c.benchmark_group("recover_blob_512B");
+    for &n in &[1_000u32, 4_000] {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s =
+                SegmentedStore::open_with_options(dir.clone(), Blob, Options::new(256)).unwrap();
+            for i in 0..n {
+                s.add(i, vec![0u8; BLOB_BYTES]).unwrap();
+            }
+            s.checkpoint().unwrap();
+        }
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                let s = SegmentedStore::open_with_options(dir.clone(), Blob, Options::new(256))
+                    .unwrap();
+                criterion::black_box(s.segment_count());
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_add,
@@ -304,6 +331,7 @@ criterion_group!(
     bench_ingest_fs,
     bench_merge_input_materialization,
     bench_compact_realistic,
-    bench_sync_policy
+    bench_sync_policy,
+    bench_recovery_blob
 );
 criterion_main!(benches);

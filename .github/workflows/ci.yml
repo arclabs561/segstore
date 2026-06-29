@@ -23,6 +23,7 @@ jobs:
         run: |
           cargo run --example inverted_index
           cargo run --example vector_search
+          cargo run --example persist_index
       - name: Doc
         run: cargo doc --no-deps
         env:

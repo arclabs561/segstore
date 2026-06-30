@@ -49,6 +49,33 @@ External research points in the same direction:
 - OCI, SRI, and in-toto provide useful exterior vocabulary: media type or
   artifact type, digest algorithm plus digest bytes, subject, predicate type,
   and provenance predicate.
+- Recent reproducible-ML infrastructure work describes the artifact graph as
+  datasets, features, workflows, executions, assets, and controlled vocabulary,
+  with executions recording inputs, outputs, configuration, and context. That is
+  closer to a generation/artifact store than to a segment store.
+
+Modern retrieval and embedding research does not point to one shared index
+format. It points to narrower per-consumer work:
+
+- Learned sparse retrieval: Block-Max Pruning for learned sparse indexes, GPU
+  scatter-add scoring over GPU-resident inverted indexes, causal/LLM sparse
+  encoders, Latent Terms, and sparse late interaction all keep the inverted
+  index central but change block layout, query processing, and scorer shape.
+- Late interaction: ColBERT-family models, LEMUR, Col-Bandit, FastLane, SLIM,
+  SPLATE, ConstBERT, and sparse-coding variants need MaxSim or MaxSim-like
+  candidate/rerank APIs. They should not be forced through a plain postings
+  list API.
+- Vector ANN: LSM-VEC, Quake, QuIVer, RaBitQ, DiskANN3, adaptive beam search,
+  and in-place graph update work all argue for algorithm-owned sidecars and
+  workload-specific maintenance. Segment lifecycle helps, but it is not the
+  algorithm.
+- Region and ontology models: RegD, octagons, TaxoBell, BoxLitE, SectorE, and
+  description-logic box variants need geometry descriptors and query semantics
+  more than generic vector storage.
+- Model-output crates: `tranz`, `subsume`, `flowmatch`, `hopfield`, and
+  `symproj` need artifact descriptors for checkpoints, codebooks, generated
+  samples, evaluation results, and training configuration. Their storage need is
+  reproducibility and comparability, not segment compaction.
 
 ## Chosen Approach
 
@@ -160,19 +187,45 @@ backend is required.
 
 1. Finish algorithm-local wins before new crate work. Current example:
    `postings::top_k_weighted` and its benchmark.
-2. Add a short `lexir` design or issue for extracting materialized-log support.
+2. Add Block-Max or Block-Max-MaxScore style learned-sparse primitives to
+   `postings` only if benchmarks show the exact weighted scorer is now the
+   bottleneck. Keep `sporse`'s WAND path independent unless a shared primitive
+   removes real duplication.
+3. Release the `vicinity` sidecar path before moving `precinct`; `precinct`
+   depends on persisted region-index components and should keep region-aware
+   recipe validation instead of adopting a vector-only format.
+4. Add a short `lexir` design or issue for extracting materialized-log support.
    Do not extract until another consumer or a focused lexir cleanup wants it.
-3. Design an artifact descriptor type on paper before code. Include digest,
+5. Design an artifact descriptor type on paper before code. Include digest,
    size, kind, codec/schema version, properties, subject links, and provenance
    hooks.
-4. Implement a local artifact store only when a concrete producer needs it,
+6. Implement a local artifact store only when a concrete producer needs it,
    likely `tranz` or `flowmatch`. Start with atomic local writes via
    `durability`.
-5. Add generation manifests after artifact descriptors exist. Start
+7. Add generation manifests after artifact descriptors exist. Start
    single-writer local. Add conditional publish and object-store adapters only
    behind an explicit backend capability design.
-6. Keep `segstore` sidecar adoption separate and consumer-by-consumer. Vicinity
+8. Keep `segstore` sidecar adoption separate and consumer-by-consumer. Vicinity
    remains the first release dependency for precinct's region-index sidecars.
+
+## Naming Shortlist
+
+Names should be plain and searchable. Current `cargo search` checks found no
+exact hits for `matlog`, `viewlog`, `genstore`, `digest-store`, or `casstore`;
+`blobstore` is already taken, and underscore searches were too broad to treat as
+availability evidence.
+
+- Materialized log: `matlog` is shortest and matches the abstraction. `viewlog`
+  is clearer if the crate centers "materialized view plus operation log" rather
+  than the checkpoint mechanics.
+- Artifact store: `digest-store` says content-addressed bytes and avoids the
+  generic `blobstore` name. `artifactstore` is plain but long and easy to
+  confuse with workflow-engine artifact APIs.
+- Generation store: `genstore` is the best placeholder if the crate publishes
+  generation manifests. `manifeststore` is more explicit if the artifact store
+  remains separate and the crate mainly publishes manifest sets.
+
+Provisional preference: `matlog`, `digest-store`, and `genstore`.
 
 ## Decision Gates
 

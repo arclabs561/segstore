@@ -139,15 +139,43 @@ fn seg_path(id: u64) -> String {
 /// (an HNSW graph, posting lists, ...) here keyed by a stable segment id; segstore
 /// garbage-collects any file in this namespace whose segment id is not in the
 /// current manifest, on the same crash-safe schedule as the segment files. The
-/// consumer owns the file's encoding (segstore never reads it).
+/// consumer owns the file's encoding and full compatibility checks (segstore
+/// never reads it). `kind` is only a short namespace/coexistence tag; new names
+/// are validated by [`SegmentedStore::try_index_name`], while GC accepts older
+/// non-empty kind strings so upgrades do not strand legacy sidecars.
 const IDX_PREFIX: &str = "segstore.idx.";
 
 /// The segment id named by an index sidecar file `segstore.idx.<id>.<kind>`, or
 /// `None` if `name` is not in the index namespace.
 fn idx_seg_id(name: &str) -> Option<u64> {
-    name.strip_prefix(IDX_PREFIX)
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|s| s.parse::<u64>().ok())
+    let rest = name.strip_prefix(IDX_PREFIX)?;
+    let (id, kind) = rest.split_once('.')?;
+    if kind.is_empty() {
+        return None;
+    }
+    id.parse::<u64>().ok()
+}
+
+fn validate_index_kind(kind: &str) -> PersistenceResult<()> {
+    if kind.is_empty() {
+        return Err(PersistenceError::InvalidConfig(
+            "index sidecar kind must be non-empty".into(),
+        ));
+    }
+    if !kind
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err(PersistenceError::InvalidConfig(format!(
+            "index sidecar kind must contain only ASCII letters, digits, '_' or '-': {kind:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn index_sidecar_name(id: u64, kind: &str) -> PersistenceResult<String> {
+    validate_index_kind(kind)?;
+    Ok(format!("{IDX_PREFIX}{id}.{kind}"))
 }
 
 /// How durable each WAL write is before [`SegmentedStore::add`] / [`SegmentedStore::delete`]
@@ -1131,11 +1159,22 @@ impl<S: Store> SegmentedStore<S> {
     }
 
     /// The reserved sidecar file name for a per-segment index of the given `kind`
-    /// (e.g. `"hnsw"`), keyed by a stable [`Self::segment_ids`] id. `kind` must not
-    /// contain `.`. Use with [`Self::dir`] to persist/load a built index that
-    /// segstore GCs in lockstep with the segment.
+    /// (e.g. `"hnsw"`), keyed by a stable [`Self::segment_ids`] id. `kind` must be
+    /// non-empty ASCII alphanumeric plus `_` or `-`. It is a short namespace tag,
+    /// not a compatibility proof; put full algorithm/config/input fingerprints in
+    /// the sidecar bytes and rebuild from the raw segment when they mismatch. Use
+    /// with [`Self::dir`] to persist/load a built index that segstore GCs in
+    /// lockstep with the segment.
+    pub fn try_index_name(&self, id: u64, kind: &str) -> PersistenceResult<String> {
+        index_sidecar_name(id, kind)
+    }
+
+    /// Infallible convenience wrapper around [`Self::try_index_name`].
+    ///
+    /// Panics if `kind` violates the documented sidecar-kind grammar.
     pub fn index_name(&self, id: u64, kind: &str) -> String {
-        format!("{IDX_PREFIX}{id}.{kind}")
+        self.try_index_name(id, kind)
+            .unwrap_or_else(|e| panic!("invalid segstore index kind: {e}"))
     }
 
     /// Live adds not yet flushed into a segment.
@@ -2011,6 +2050,78 @@ mod tests {
         drop(s);
         let _ = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
         assert_eq!(idx_count(&dir), 0, "orphan sidecar GC'd on open");
+    }
+
+    #[test]
+    fn legacy_sidecar_names_are_still_gced() {
+        // `try_index_name` rejects dotted kinds for new writes, but pre-grammar
+        // releases allowed callers to write names such as `hnsw.v1`. Treat them
+        // as sidecars for GC so upgrades do not strand stale derived artifacts.
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+        for i in 0..4u32 {
+            s.add(i, format!("v{i}")).unwrap();
+        }
+        s.checkpoint().unwrap();
+        let stale_id = s.segment_ids()[0];
+        dir.atomic_write(&format!("{IDX_PREFIX}{stale_id}.hnsw.v1"), b"old-index")
+            .unwrap();
+
+        s.compact().unwrap();
+
+        assert!(
+            !dir.exists(&format!("{IDX_PREFIX}{stale_id}.hnsw.v1")),
+            "legacy dotted-kind sidecar is removed when its segment is compacted away"
+        );
+    }
+
+    #[test]
+    fn index_sidecar_kind_is_checked() {
+        let dir = MemoryDirectory::arc();
+        let s = SegmentedStore::open(dir, Kv, 2).unwrap();
+
+        assert_eq!(
+            s.try_index_name(7, "hnsw_v1-fast").unwrap(),
+            "segstore.idx.7.hnsw_v1-fast"
+        );
+
+        for kind in ["", "hnsw.v1", "hnsw/tmp", "../hnsw", ".tmp", "hnsw tmp"] {
+            assert!(
+                matches!(
+                    s.try_index_name(7, kind),
+                    Err(PersistenceError::InvalidConfig(_))
+                ),
+                "kind {kind:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid segstore index kind")]
+    fn index_name_panics_on_invalid_kind() {
+        let dir = MemoryDirectory::arc();
+        let s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        let _ = s.index_name(7, "hnsw.v1");
+    }
+
+    #[test]
+    fn index_sidecar_parser_recognizes_legacy_names_for_gc() {
+        assert_eq!(idx_seg_id("segstore.idx.7.hnsw_v1-fast"), Some(7));
+        assert_eq!(
+            idx_seg_id("segstore.idx.7.hnsw.v1"),
+            Some(7),
+            "legacy dotted kind is still classified for cleanup"
+        );
+
+        for name in [
+            "segstore.idx.7",
+            "segstore.idx.7.",
+            "segstore.idx.not-a-number.hnsw",
+            "segstore.idx..hnsw",
+            "not-segstore.idx.7.hnsw",
+        ] {
+            assert_eq!(idx_seg_id(name), None, "{name:?} should not parse");
+        }
     }
 
     #[test]

@@ -295,6 +295,45 @@ fn bench_sync_policy(c: &mut Criterion) {
     g.finish();
 }
 
+/// Compaction with one consumer sidecar per input segment. This isolates the
+/// sidecar-GC tax added by persisted built-index caches: the compact itself is
+/// identical, but the `with_sidecars` arm also deletes stale `segstore.idx.*`
+/// files for the segments that disappeared.
+fn bench_sidecar_gc_on_compact(c: &mut Criterion) {
+    let mut g = c.benchmark_group("sidecar_gc_compact_4k");
+    for sidecars in [false, true] {
+        let label = if sidecars {
+            "with_sidecars"
+        } else {
+            "without_sidecars"
+        };
+        g.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let dir = MemoryDirectory::arc();
+                    let mut s =
+                        SegmentedStore::open_with_options(dir.clone(), Kv, Options::new(64))
+                            .unwrap();
+                    fill(&mut s, 4_000);
+                    s.checkpoint().unwrap();
+                    if sidecars {
+                        for &id in s.segment_ids() {
+                            dir.atomic_write(&s.index_name(id, "bench"), b"built-index")
+                                .unwrap();
+                        }
+                    }
+                    s
+                },
+                |mut s| {
+                    s.compact().unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    g.finish();
+}
+
 /// Recovery (reopen) cost on the 512-byte payload, the dimension where zero-copy
 /// would matter: `open` postcard-DECODES every segment file (O(total payload)),
 /// while queries are in-memory and never decode. Contrast the toy `recover` group
@@ -332,6 +371,7 @@ criterion_group!(
     bench_merge_input_materialization,
     bench_compact_realistic,
     bench_sync_policy,
+    bench_sidecar_gc_on_compact,
     bench_recovery_blob
 );
 criterion_main!(benches);

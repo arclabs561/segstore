@@ -39,20 +39,37 @@ Existing local decisions matter:
 External research points in the same direction:
 
 - BatchWeave-style object stores publish immutable payloads through versioned
-  manifests and conditional writes. Payload existence alone is not visibility.
+  manifests and conditional writes. Payload existence alone is not visibility:
+  a batch or generation becomes visible only when a committed manifest names it.
+  Watermark-based GC belongs to the manifest/generation layer, not the blob
+  layer.
 - Iceberg Puffin-style index sidecars bind typed derived artifacts to a snapshot
-  while letting engines ignore unknown blob types.
+  while letting engines ignore unknown blob types. The useful fields are blob
+  type, covered field ids or subjects, offset/length, compression, and a
+  property map carrying algorithm parameters such as dimensions, metric, and
+  snapshot id.
 - OxyMake-style artifact keys include declared input digests, rule code,
-  parameters, environment, and platform. Correctness only covers declared inputs.
+  parameters, environment, shell, and platform. Correctness only covers declared
+  inputs unless a sandbox prevents hidden inputs.
 - Atompack-style immutable datasets optimize for mmap and whole-record shuffled
   reads. That is a different shape from a mutable segment store.
 - OCI, SRI, and in-toto provide useful exterior vocabulary: media type or
   artifact type, digest algorithm plus digest bytes, subject, predicate type,
-  and provenance predicate.
+  and provenance predicate. Their strongest lesson for v1 is tolerant
+  evolution: readers should ignore unknown artifact types or provenance
+  predicates unless they explicitly require them.
 - Recent reproducible-ML infrastructure work describes the artifact graph as
   datasets, features, workflows, executions, assets, and controlled vocabulary,
   with executions recording inputs, outputs, configuration, and context. That is
   closer to a generation/artifact store than to a segment store.
+- Rust prior art separates backend access from data-model lifecycle.
+  `object_store` is the strongest fit when we need object-store semantics:
+  atomic writes, conditional operations, ranged/vectored reads, and S3/GCS/Azure
+  backends. OpenDAL has broader service coverage and layering, but it is still a
+  portability layer, not a generation-manifest model. `redb`, `fjall`, and
+  other embedded KV engines are useful substrates for specific local indexes,
+  but they do not provide artifact descriptors, provenance, or publish
+  semantics by themselves.
 
 Modern retrieval and embedding research does not point to one shared index
 format. It points to narrower per-consumer work:
@@ -96,23 +113,30 @@ The generation/artifact split should be conceptual first and crate-level only
 when implementation pressure appears:
 
 - Artifact store: content-addressed bytes, descriptor metadata, optional
-  provenance records, and local atomic writes. Descriptor fields should include
-  kind or media type, digest algorithm, digest bytes, byte length, codec/schema
-  version, properties, and optional subject links.
-- Generation store: a published manifest naming a set of artifact descriptors.
-  A generation is visible only after the manifest is durably published. Readers
-  can pin a generation. Garbage collection uses reader pins and watermarks.
+  provenance records, and local atomic writes. Descriptor fields should include:
+  `artifact_type` or `media_type`, digest algorithm, digest bytes, byte length,
+  codec/schema version, properties, optional subject links, and optional
+  provenance statement references.
+- Generation store: a durably published manifest naming a set of artifact
+  descriptors, declared input descriptors, and optional execution/provenance
+  records. A generation is visible only after the manifest is published.
+  Readers can pin a generation. Garbage collection uses reader pins and
+  watermarks.
 
 Use standard-friendly identifiers without adopting a full external system in v1:
 
 - Support algorithm-tagged digests. Prefer `sha256` in exported descriptors
-  because OCI and SRI ecosystems understand it. Allow `blake3` for local fast
-  cache keys when explicitly marked.
+  because OCI, SRI, and in-toto ecosystems understand it. Allow `blake3` for
+  local fast cache keys when explicitly marked. If both are present, treat
+  `sha256` as the portability digest and `blake3` as a local acceleration key.
 - Use media-type-like strings for artifact kinds when exporting. Internally, a
   small typed enum or validated slug is enough.
 - Model provenance after in-toto's shape: subject digest, predicate type, and
   predicate bytes or structured data. Do not implement signing or policy
   verification in v1.
+- Keep manifests append-friendly and tolerant of unknown records. Readers should
+  be able to load artifacts they understand and skip descriptors whose
+  `artifact_type`, codec, or predicate type is unknown.
 
 ## Options Considered
 
@@ -149,9 +173,10 @@ backend is required.
 
 ## Per-Crate Fit
 
-- `lexir`: best first candidate for a materialized-log helper. Its CLI already
-  has the pattern; extraction would reduce repeated correctness code if another
-  crate needs it.
+- `lexir`: best first candidate for a materialized-log helper. Its CLI now has
+  one internal recovery helper for checkpoint plus unapplied log suffix and one
+  internal rewrite helper for compact/prune. Extraction is still not justified
+  until another crate needs the same pattern.
 - `postings`: should grow query/index features, not storage first. The next
   storage-relevant artifact is a sparse postings sidecar with block maxima and
   codec/schema version, likely through `segstore` if postings becomes segmented.
@@ -198,6 +223,12 @@ The shared envelope shape is visible, but it should still stay local for now:
 the recipe contents and payload validation differ by algorithm, while segstore
 only needs to provide stable sidecar names and garbage collection.
 
+`lexir` now has an internal materialized-log cleanup: `log-add`, `log-delete`,
+`log-search`, `log-checkpoint`, and `log-validate` share the same
+checkpoint-plus-suffix recovery path, and `log-compact`/`log-prune` share the
+self-contained rewrite path. This reduces the risk of diverging meta semantics,
+but it is still one consumer, so it does not cross the crate-extraction gate.
+
 ## Non-Goals
 
 - Do not turn `durability` into a KV store, table format, or artifact registry.
@@ -220,8 +251,8 @@ only needs to provide stable sidecar names and garbage collection.
 3. Release the `vicinity` sidecar path before moving `precinct`. Done:
    `vicinity 0.10.5` exposes graph postcard persistence under `persistence`, and
    `precinct` uses a region-aware sidecar format rather than a vector-only one.
-4. Add a short `lexir` design or issue for extracting materialized-log support.
-   Do not extract until another consumer or a focused lexir cleanup wants it.
+4. Keep the `lexir` materialized-log cleanup internal. Do not extract until a
+   second consumer needs checkpoint plus operation-log replay.
 5. Design an artifact descriptor type on paper before code. Include digest,
    size, kind, codec/schema version, properties, subject links, and provenance
    hooks.
@@ -262,7 +293,10 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
   reproducibility metadata, implement the artifact descriptor/store before
   adding more ad hoc save/load paths.
 - If any artifact store needs S3/GCS/Azure, design a backend capability matrix
-  before choosing `object_store`, `opendal`, or a custom trait.
+  before choosing `object_store`, `opendal`, or a custom trait. Default toward
+  `object_store` if conditional object writes and range reads are the central
+  need; default toward OpenDAL only if broad backend coverage is itself the
+  requirement.
 - If a segstore sidecar becomes non-rebuildable from raw segment data, stop and
   design manifest-tracked index generations.
 - If external interoperability becomes a user requirement, add OCI or
@@ -272,11 +306,33 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
 
 - Crate names are not chosen. `artifactstore`, `genstore`, and `matlog` describe
   the bounded contexts, but naming should happen when implementation starts.
-- Digest policy needs a final default. `sha256` is the safest export default;
-  `blake3` is attractive for local cache keys.
+- Digest policy needs a final default. Current leaning: `sha256` is required
+  for exported descriptors; `blake3` is optional for local cache keys.
 - The first concrete artifact producer is still open. `tranz` has the clearest
   export gap (`.npy` and embedding descriptors); `flowmatch` has the clearest
   generation/provenance gap.
+
+## Research Sources
+
+- BatchWeave: versioned manifests, conditional object writes, manifest-gated
+  visibility, and watermark-based reclamation for training batches.
+  <https://arxiv.org/abs/2605.09994>
+- OxyMake: content-addressed workflow keys over declared inputs, rule source,
+  parameters, environment, shell, and platform, with the undeclared-input caveat.
+  <https://arxiv.org/abs/2606.20989>
+- Puffin-backed vector indexes: typed sidecar blobs bound to Iceberg snapshots
+  with unknown-blob tolerance and properties for algorithm validation.
+  <https://arxiv.org/abs/2606.04196>
+- Reproducible ML infrastructure: Dataset, Feature, Workflow, Execution, Asset,
+  and Controlled Vocabulary as first-class artifact types.
+  <https://arxiv.org/abs/2506.16051>
+- Rust backend prior art: `object_store` and OpenDAL are backend abstraction
+  layers, not generation-store models. <https://docs.rs/object_store> and
+  <https://opendal.apache.org/>
+- Descriptor vocabulary: OCI artifacts, W3C SRI, and in-toto/SLSA provenance.
+  <https://github.com/opencontainers/image-spec/blob/main/manifest.md>,
+  <https://www.w3.org/TR/sri-2/>, and
+  <https://slsa.dev/blog/2023/05/in-toto-and-slsa>
 
 ---
 Decided: 2026-06-30 | Session: Codex handoff from Claude 03edba07

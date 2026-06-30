@@ -173,6 +173,31 @@ backend is required.
   consume artifact descriptors when their scorers, projections, or memory banks
   become external data products.
 
+## Implementation Status
+
+The sidecar path is now implemented in four consumers, and the variation is
+real enough to keep the consumer-owned recipe boundary.
+
+- `vicinity 0.10.5`: released graph persistence under `persistence`, plus
+  per-segment HNSW sidecars guarded by dimension, metric, normalization, HNSW
+  build parameters, and codec recipe.
+- `precinct`: per-segment region sidecars persist the original regions, id map,
+  center HNSW graph, and lifted power-distance HNSW graph. Bench evidence over
+  8k 64d regions: cold restart with sidecars measured `[10.150 ms 10.350 ms
+  10.553 ms]`; missing sidecars rebuilt in `[1.7605 s 1.7678 s 1.7750 s]`.
+- `sporse`: per-segment WAND sidecars persist finalized posting lists and
+  block-max metadata plus the live id set. Bench evidence over 20k sparse docs:
+  cold restart with sidecars measured `[31.390 ms 31.937 ms 32.538 ms]`;
+  missing sidecars rebuilt in `[105.88 ms 107.20 ms 108.85 ms]`.
+- `sketchir`: per-segment MinHash sidecars persist the built LSH block and
+  insertion-order id map, guarded by the `BlockingConfig` recipe. Bench evidence
+  over 20k documents: cold restart with sidecars measured `[42.303 ms 42.631 ms
+  42.942 ms]`; missing sidecars rebuilt in `[478.41 ms 480.19 ms 482.13 ms]`.
+
+The shared envelope shape is visible, but it should still stay local for now:
+the recipe contents and payload validation differ by algorithm, while segstore
+only needs to provide stable sidecar names and garbage collection.
+
 ## Non-Goals
 
 - Do not turn `durability` into a KV store, table format, or artifact registry.
@@ -185,15 +210,16 @@ backend is required.
 
 ## Implementation Plan
 
-1. Finish algorithm-local wins before new crate work. Current example:
-   `postings::top_k_weighted` and its benchmark.
+1. Finish algorithm-local wins before new crate work. Done for the immediate
+   batch: `postings::top_k_weighted` has a dense accumulator fast path, and the
+   four segstore-backed consumers above have restart sidecars.
 2. Add Block-Max or Block-Max-MaxScore style learned-sparse primitives to
    `postings` only if benchmarks show the exact weighted scorer is now the
    bottleneck. Keep `sporse`'s WAND path independent unless a shared primitive
    removes real duplication.
-3. Release the `vicinity` sidecar path before moving `precinct`; `precinct`
-   depends on persisted region-index components and should keep region-aware
-   recipe validation instead of adopting a vector-only format.
+3. Release the `vicinity` sidecar path before moving `precinct`. Done:
+   `vicinity 0.10.5` exposes graph postcard persistence under `persistence`, and
+   `precinct` uses a region-aware sidecar format rather than a vector-only one.
 4. Add a short `lexir` design or issue for extracting materialized-log support.
    Do not extract until another consumer or a focused lexir cleanup wants it.
 5. Design an artifact descriptor type on paper before code. Include digest,
@@ -205,8 +231,9 @@ backend is required.
 7. Add generation manifests after artifact descriptors exist. Start
    single-writer local. Add conditional publish and object-store adapters only
    behind an explicit backend capability design.
-8. Keep `segstore` sidecar adoption separate and consumer-by-consumer. Vicinity
-   remains the first release dependency for precinct's region-index sidecars.
+8. Keep `segstore` sidecar adoption separate and consumer-by-consumer. The first
+   adoption wave confirms this: HNSW, region HNSW, WAND, and MinHash all share
+   lifecycle mechanics but not payload recipes.
 
 ## Naming Shortlist
 

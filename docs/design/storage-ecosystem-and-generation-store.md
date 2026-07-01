@@ -183,11 +183,12 @@ backend is required.
 - `vicinity`, `precinct`, `sporse`, `sketchir`: keep using `segstore` sidecars,
   each with algorithm-specific recipe validation. Avoid one shared sidecar
   codec until two consumers converge on the same header mechanics.
-- `tranz`: needs artifact export more than segstore. Trained embeddings should
-  have descriptor metadata covering model family, dimension, entity/relation
-  vocabularies, score convention, normalization, training config, dataset
-  digest, and metric results. `.npy` or safetensors export can coexist with a
-  local descriptor.
+- `tranz`: needs artifact export more than segstore. It now writes a local
+  `manifest.json` beside `entities.tsv` and `relations.tsv`, with model family,
+  score convention, split counts, SHA-256 digests, byte sizes, training config,
+  final loss, and optional aggregate metrics. Dataset digests and binary matrix
+  formats such as `.npy` or safetensors can come later without turning this into
+  a shared store yet.
 - `subsume`: same artifact need, but with geometry-specific descriptors:
   region family, dimension, containment direction, beta/temperature schedule,
   dataset digest, ontology vocab, and checkpoint format.
@@ -229,6 +230,13 @@ checkpoint-plus-suffix recovery path, and `log-compact`/`log-prune` share the
 self-contained rewrite path. This reduces the risk of diverging meta semantics,
 but it is still one consumer, so it does not cross the crate-extraction gate.
 
+`tranz` is the first concrete artifact producer, but only at the crate-local
+descriptor layer. Its training CLI writes `manifest.json` for exported embedding
+TSVs and records per-file SHA-256, byte length, model/training config, split
+counts, final loss, and optional aggregate metrics. That validates the
+descriptor shape without committing to `genstore`, `digest-store`, or a shared
+artifact lifecycle crate.
+
 ## Non-Goals
 
 - Do not turn `durability` into a KV store, table format, or artifact registry.
@@ -256,9 +264,9 @@ but it is still one consumer, so it does not cross the crate-extraction gate.
 5. Design an artifact descriptor type on paper before code. Include digest,
    size, kind, codec/schema version, properties, subject links, and provenance
    hooks.
-6. Implement a local artifact store only when a concrete producer needs it,
-   likely `tranz` or `flowmatch`. Start with atomic local writes via
-   `durability`.
+6. Keep `tranz`'s first descriptor local. Add a shared artifact store only when
+   a second producer, likely `flowmatch`, needs the same descriptor and publish
+   mechanics. Start with atomic local writes via `durability`.
 7. Add generation manifests after artifact descriptors exist. Start
    single-writer local. Add conditional publish and object-store adapters only
    behind an explicit backend capability design.
@@ -308,9 +316,9 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
   the bounded contexts, but naming should happen when implementation starts.
 - Digest policy needs a final default. Current leaning: `sha256` is required
   for exported descriptors; `blake3` is optional for local cache keys.
-- The first concrete artifact producer is still open. `tranz` has the clearest
-  export gap (`.npy` and embedding descriptors); `flowmatch` has the clearest
-  generation/provenance gap.
+- The second concrete artifact producer is still open. `flowmatch` has the
+  clearest generation/provenance gap; `tranz` can still grow dataset digests and
+  binary matrix artifacts without forcing a shared crate.
 
 ## Research Sources
 

@@ -84,6 +84,11 @@ format. It points to narrower per-consumer work:
   scatter-add scoring over GPU-resident inverted indexes, causal/LLM sparse
   encoders, Latent Terms, and sparse late interaction all keep the inverted
   index central but change block layout, query processing, and scorer shape.
+  A later pass sharpened this: SPLADE is now a baseline family, not the frontier.
+  DF-FLOPS attacks high document-frequency terms, Two-Step SPLADE and
+  billion-scale SPLADE work use pruned first-stage vectors plus top-k query-term
+  selection, Latent Terms extracts BM25-ready sparse vocabularies from dense
+  retrievers, and GPUSparse treats exact sparse scoring as batched scatter-add.
 - Late interaction: ColBERT-family models, LEMUR, Col-Bandit, FastLane, SLIM,
   SPLATE, ConstBERT, and sparse-coding variants need MaxSim or MaxSim-like
   candidate/rerank APIs. They should not be forced through a plain postings
@@ -218,6 +223,12 @@ backend is required.
 - `postings`: should grow query/index features, not storage first. The next
   storage-relevant artifact is a sparse postings sidecar with block maxima and
   codec/schema version, likely through `segstore` if postings becomes segmented.
+  It now has benchmark coverage for learned-sparse query length, top-weight
+  query-term masking, rare/selective terms, sparse external doc ids, and the
+  historical `PosingsIndex` positional phrase/proximity surface. The measured
+  next forks are separate: weighted learned-sparse needs high-DF pruning and a
+  better sparse-doc-id accumulator; positional search needed allocation/hash
+  removal before any storage work.
 - `vicinity`, `precinct`, `sporse`, `sketchir`: keep using `segstore` sidecars,
   each with algorithm-specific recipe validation. Avoid one shared sidecar
   codec until two consumers converge on the same header mechanics.
@@ -300,11 +311,17 @@ artifact lifecycle crate.
 
 1. Finish algorithm-local wins before new crate work. Done for the immediate
    batch: `postings::top_k_weighted` has a dense accumulator fast path, and the
-   four segstore-backed consumers above have restart sidecars.
+   four segstore-backed consumers above have restart sidecars. A follow-up
+   `postings` pass added learned-sparse and positional benchmark coverage, then
+   sped up positional phrase and unordered NEAR by removing per-candidate
+   shifted-list allocation and string-keyed hash counting.
 2. Add Block-Max or Block-Max-MaxScore style learned-sparse primitives to
-   `postings` only if benchmarks show the exact weighted scorer is now the
-   bottleneck. Keep `sporse`'s WAND path independent unless a shared primitive
-   removes real duplication.
+   `postings` only after the simpler measured forks are exhausted. The current
+   benchmark says expanded high-DF queries and sparse external doc ids dominate:
+   first compare the `HashMap` sparse-doc-id fallback against a sort/reduce
+   accumulator, then prototype query-term masking or block maxima only if the
+   exact weighted scorer remains the bottleneck. Keep `sporse`'s WAND path
+   independent unless a shared primitive removes real duplication.
 3. Release the `vicinity` sidecar path before moving `precinct`. Done:
    `vicinity 0.10.5` exposes graph postcard persistence under `persistence`, and
    `precinct` uses a region-aware sidecar format rather than a vector-only one.
@@ -419,6 +436,22 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
   concern. <https://arxiv.org/abs/2605.17415>,
   <https://arxiv.org/abs/2505.15070>, and
   <https://arxiv.org/abs/2605.29384>
+- Learned-sparse and late-interaction query processing: Block-Max Pruning for
+  learned sparse indexes, Two-Step SPLADE, GPUSparse, SPLATE, ColBERTSaR, and a
+  PLAID reproducibility study all point to per-query pruning, staging, and
+  payload layout as algorithm decisions rather than generic store decisions.
+  <https://arxiv.org/abs/2405.01117>,
+  <https://arxiv.org/abs/2404.13357>,
+  <https://arxiv.org/abs/2606.26441>,
+  <https://arxiv.org/abs/2404.13950>,
+  <https://arxiv.org/abs/2606.05568>, and
+  <https://arxiv.org/abs/2404.14989>
+- Dynamic vector-index pressure beyond HNSW: IVF-TQ and LSM-VEC show that
+  trained codebooks, graph topology, raw vectors, and residual encodings age at
+  different rates under streaming updates. That strengthens the case for
+  algorithm-owned sidecars and, when artifacts are not rebuildable,
+  manifest-tracked index generations. <https://arxiv.org/abs/2605.17415> and
+  <https://arxiv.org/abs/2505.17152>
 
 ---
 Decided: 2026-06-30 | Session: Codex handoff from Claude 03edba07

@@ -210,6 +210,32 @@ For `lexir`, there are two plausible futures:
   (`N`, `df`, `avgdl`) must be handled explicitly so segment-local candidate
   generation does not corrupt global scoring.
 
+## Crate-Local Artifact Producers
+
+Two consumers now produce durable descriptors, but they are still different
+enough that a shared "artifact store" crate would be premature:
+
+- `tranz` writes an embedding export manifest. Its durable unit is a set of
+  artifact files plus metadata: schema, model, score order, artifact bytes and
+  SHA-256 digests, embedding dimensions and row counts, dataset split counts,
+  training config, final loss, and optional eval metrics.
+- `flowmatch` writes a USGS pipeline run report when `FLOWMATCH_REPORT_OUT` is
+  set. Its durable unit is a structured report: schema, dataset identity,
+  training/evaluation configs, seeds, metric pairs, and timing breakdowns. It
+  does not yet reference separate artifact files or content digests.
+
+This is enough to standardize vocabulary in future designs: schema id, producer,
+inputs, config, metrics, timings, artifacts, and digests. It is not enough to
+standardize storage mechanics. `tranz` needs a file-artifact manifest;
+`flowmatch` needs a run-report record; sidecar consumers need segment-attached
+rebuildable caches; `lexir` needs a materialized operation log.
+
+Use current crate names when describing these relationships. `vicinity` is the
+ANN/HNSW crate formerly referred to as `jin`. `tranz` is the point-embedding KGE
+crate for TransE/RotatE/ComplEx/DistMult. `sheaf` is still the current facade for
+the cluster, Leiden, distribution-distance, and kNN graph evaluation APIs used
+by `flowmatch`.
+
 ## Segstore Feature Use
 
 What consumers already get from segstore:

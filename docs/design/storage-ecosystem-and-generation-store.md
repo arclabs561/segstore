@@ -48,6 +48,12 @@ External research points in the same direction:
   type, covered field ids or subjects, offset/length, compression, and a
   property map carrying algorithm parameters such as dimensions, metric, and
   snapshot id.
+- A deeper pass over the Puffin vector-index paper and Iceberg specs sharpens
+  the boundary: Puffin statistics files are optional information that readers
+  may ignore, but a snapshot can bind a derived artifact to exactly the data
+  generation it was computed from. That is the right model for non-rebuildable
+  or cross-engine derived indexes, not for segstore's rebuildable per-segment
+  caches.
 - OxyMake-style artifact keys include declared input digests, rule code,
   parameters, environment, shell, and platform. Correctness only covers declared
   inputs unless a sandbox prevents hidden inputs.
@@ -123,6 +129,38 @@ when implementation pressure appears:
   Readers can pin a generation. Garbage collection uses reader pins and
   watermarks.
 
+The refined generation-store contract is:
+
+- `ArtifactDescriptor`: media-type-like kind, digest string, byte length,
+  codec/schema version, optional properties, optional subject links, and optional
+  provenance references.
+- `GenerationManifest`: immutable set of output artifact descriptors, declared
+  input descriptors, execution/config metadata, and optional parent/base
+  generation id.
+- `GenerationPointer`: the small durable commit point naming the current
+  manifest. Payload bytes are written first; the pointer is published last.
+- `ReaderPin`: an in-process or persisted lease saying a reader may still use a
+  generation. Garbage collection must keep the manifest and transitive artifacts
+  while any pin or retention watermark protects them.
+- `Validation`: consumers verify size and digest before trusting bytes, then
+  verify their own schema/recipe properties before using the artifact.
+- `Evolution`: unknown artifact kinds, codecs, and provenance predicates are
+  skipped unless the caller explicitly requires them.
+
+This is useful when at least one of these is true:
+
+- The derived state is expensive or impossible to rebuild from local segment
+  payloads.
+- Readers need stable snapshot semantics across process restarts or concurrent
+  writers.
+- A model, dataset, codebook, benchmark result, or trained global index needs
+  reproducibility metadata.
+- A corpus-level trained artifact, such as IVF/PQ codebooks or a global ANN
+  generation, must be published atomically against a specific input snapshot.
+
+It is not useful for ordinary segstore sidecars while those sidecars are
+rebuildable from raw segment files.
+
 Use standard-friendly identifiers without adopting a full external system in v1:
 
 - Support algorithm-tagged digests. Prefer `sha256` in exported descriptors
@@ -189,15 +227,26 @@ backend is required.
   final loss, and optional aggregate metrics. Dataset digests and binary matrix
   formats such as `.npy` or safetensors can come later without turning this into
   a shared store yet.
-- `subsume`: same artifact need, but with geometry-specific descriptors:
-  region family, dimension, containment direction, beta/temperature schedule,
-  dataset digest, ontology vocab, and checkpoint format.
+- `subsume`: same artifact need, but with geometry-specific descriptors. Its
+  current JSON save/load for `TrainedElModel` is a model artifact, not a store.
+  A descriptor should record region family, dimension, containment direction,
+  beta/temperature schedule, dataset digest, ontology vocabulary, checkpoint
+  format, and metric/eval summary.
 - `flowmatch`: generation manifests fit experiment outputs: dataset digest,
   coupling method, ODE solver, training config, seed, model parameters, metrics,
-  and generated sample artifacts.
-- `heyting`, `symproj`, `hopfield`: no immediate store extraction. They can
-  consume artifact descriptors when their scorers, projections, or memory banks
-  become external data products.
+  and generated sample artifacts. The current USGS report validates the report
+  vocabulary but does not yet reference artifact files or content digests.
+- `symproj`: no store yet, but trained or imported codebooks are natural
+  artifacts once they become external files. A descriptor should record tokenizer
+  identity, vocabulary size, dimension, pooling/normalization policy, source
+  model or corpus, and matrix digest.
+- `hopfield`: no store yet. If memory banks become durable data products, they
+  fit artifact descriptors: pattern count, dimension, normalization, energy
+  function, separation map, and source dataset digest. They do not need segstore
+  unless updates become segmented and queryable.
+- `heyting`: no immediate store extraction. It mostly adapts scorer APIs; it
+  should consume `tranz` or `subsume` descriptors when external scorers become
+  loadable assets, not define its own persistence model first.
 
 ## Implementation Status
 
@@ -264,9 +313,10 @@ artifact lifecycle crate.
 5. Design an artifact descriptor type on paper before code. Include digest,
    size, kind, codec/schema version, properties, subject links, and provenance
    hooks.
-6. Keep `tranz`'s first descriptor local. Add a shared artifact store only when
-   a second producer, likely `flowmatch`, needs the same descriptor and publish
-   mechanics. Start with atomic local writes via `durability`.
+6. Keep `tranz`'s first descriptor local. Add shared descriptor code only after
+   a second producer needs the same field names and validation rules. `flowmatch`
+   is close, but its current report is still a run record without artifact-file
+   descriptors.
 7. Add generation manifests after artifact descriptors exist. Start
    single-writer local. Add conditional publish and object-store adapters only
    behind an explicit backend capability design.
@@ -300,6 +350,9 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
 - If a consumer needs to publish immutable experiment/model outputs with
   reproducibility metadata, implement the artifact descriptor/store before
   adding more ad hoc save/load paths.
+- If readers need to pin multiple visible artifact sets while writers publish
+  replacements, promote from artifact descriptors to a generation manifest plus
+  reader-pin and retention rules.
 - If any artifact store needs S3/GCS/Azure, design a backend capability matrix
   before choosing `object_store`, `opendal`, or a custom trait. Default toward
   `object_store` if conditional object writes and range reads are the central
@@ -317,8 +370,23 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
 - Digest policy needs a final default. Current leaning: `sha256` is required
   for exported descriptors; `blake3` is optional for local cache keys.
 - The second concrete artifact producer is still open. `flowmatch` has the
-  clearest generation/provenance gap; `tranz` can still grow dataset digests and
-  binary matrix artifacts without forcing a shared crate.
+  clearest generation/provenance gap, but its current report lacks artifact
+  descriptors and digests. `subsume` model checkpoints are the other likely
+  forcing function.
+
+## Primary Source Read Depth
+
+- Puffin-backed vector indexes, arXiv:2606.04196: read abstract, sections 2.1,
+  3.2, 4, 5, 7, 10, 11, and conclusion from the PDF text. I did not read every
+  cited ANN reference or the companion wire-format document.
+- Apache Iceberg table spec and Puffin spec: checked snapshot, manifest-list,
+  table-statistics, and BlobMetadata fields. The important spec point is that
+  statistics files are informational and readers may ignore them, while blob
+  metadata carries type, field ids, snapshot id, offset, length, compression, and
+  properties.
+- OCI descriptor spec: checked descriptor fields and digest rules. The useful
+  portable minimum is still media type, digest string, and byte size, with
+  SHA-256 required for compliant descriptor verification.
 
 ## Research Sources
 
@@ -331,16 +399,26 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
 - Puffin-backed vector indexes: typed sidecar blobs bound to Iceberg snapshots
   with unknown-blob tolerance and properties for algorithm validation.
   <https://arxiv.org/abs/2606.04196>
+- Apache Iceberg table and Puffin specs: snapshots, manifest lists,
+  informational statistics files, and BlobMetadata fields.
+  <https://iceberg.apache.org/spec/> and
+  <https://iceberg.apache.org/puffin-spec/>
 - Reproducible ML infrastructure: Dataset, Feature, Workflow, Execution, Asset,
   and Controlled Vocabulary as first-class artifact types.
   <https://arxiv.org/abs/2506.16051>
 - Rust backend prior art: `object_store` and OpenDAL are backend abstraction
   layers, not generation-store models. <https://docs.rs/object_store> and
   <https://opendal.apache.org/>
-- Descriptor vocabulary: OCI artifacts, W3C SRI, and in-toto/SLSA provenance.
-  <https://github.com/opencontainers/image-spec/blob/main/manifest.md>,
+- Descriptor vocabulary: OCI descriptors, W3C SRI, and in-toto/SLSA provenance.
+  <https://github.com/opencontainers/image-spec/blob/main/descriptor.md>,
   <https://www.w3.org/TR/sri-2/>, and
   <https://slsa.dev/blog/2023/05/in-toto-and-slsa>
+- Dynamic and learned-index pressure: IVF-TQ highlights codebook drift in
+  streaming vector search; recent SPLADE variants and Latent Terms reinforce
+  postings as a first-class learned-sparse substrate rather than a storage-layer
+  concern. <https://arxiv.org/abs/2605.17415>,
+  <https://arxiv.org/abs/2505.15070>, and
+  <https://arxiv.org/abs/2605.29384>
 
 ---
 Decided: 2026-06-30 | Session: Codex handoff from Claude 03edba07

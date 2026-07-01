@@ -86,6 +86,11 @@ the last view holding it drops). Publishing only at the checkpoint keeps the
 snapshot off the ingest hot path -- republishing per write would make bulk ingest
 quadratic.
 
+## Examples
+
+See [examples/README.md](examples/README.md) for runnable examples with
+captured output.
+
 ## Status
 
 0.x; the API and on-disk format may change between minor versions.

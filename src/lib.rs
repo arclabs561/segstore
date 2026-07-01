@@ -141,8 +141,8 @@ fn seg_path(id: u64) -> String {
 /// current manifest, on the same crash-safe schedule as the segment files. The
 /// consumer owns the file's encoding and full compatibility checks (segstore
 /// never reads it). `kind` is only a short namespace/coexistence tag; new names
-/// are validated by [`SegmentedStore::try_index_name`], while GC accepts older
-/// non-empty kind strings so upgrades do not strand legacy sidecars.
+/// are validated by [`try_index_name`], while GC accepts older non-empty kind
+/// strings so upgrades do not strand legacy sidecars.
 const IDX_PREFIX: &str = "segstore.idx.";
 
 /// The segment id named by an index sidecar file `segstore.idx.<id>.<kind>`, or
@@ -176,6 +176,25 @@ fn validate_index_kind(kind: &str) -> PersistenceResult<()> {
 fn index_sidecar_name(id: u64, kind: &str) -> PersistenceResult<String> {
     validate_index_kind(kind)?;
     Ok(format!("{IDX_PREFIX}{id}.{kind}"))
+}
+
+/// The reserved sidecar file name for a consumer's per-segment built index.
+///
+/// Use this with [`View::segment_ids`] when a reader/searcher needs to load a
+/// persisted sidecar without holding the writer's [`SegmentedStore`] handle.
+/// `kind` must be non-empty ASCII alphanumeric plus `_` or `-`. It is a short
+/// namespace tag, not a compatibility proof; put full algorithm/config/input
+/// fingerprints in the sidecar bytes and rebuild from the raw segment when they
+/// mismatch.
+pub fn try_index_name(id: u64, kind: &str) -> PersistenceResult<String> {
+    index_sidecar_name(id, kind)
+}
+
+/// Infallible convenience wrapper around [`try_index_name`].
+///
+/// Panics if `kind` violates the documented sidecar-kind grammar.
+pub fn index_name(id: u64, kind: &str) -> String {
+    try_index_name(id, kind).unwrap_or_else(|e| panic!("invalid segstore index kind: {e}"))
 }
 
 /// How durable each WAL write is before [`SegmentedStore::add`] / [`SegmentedStore::delete`]
@@ -385,8 +404,9 @@ impl<S: Store> View<S> {
     /// The stable persistence id of each segment in [`Self::segments`], same order.
     /// Unlike the segment's `Arc` pointer, this id is stable across checkpoints AND
     /// restarts (it names the segment's `segstore.seg.<id>` file), so a consumer can
-    /// key a *persisted* per-segment built-index cache on it and reload across a
-    /// process restart instead of rebuilding from the raw payload.
+    /// key a *persisted* per-segment built-index cache on it (via
+    /// [`try_index_name`]) and reload across a process restart instead of rebuilding
+    /// from the raw payload.
     pub fn segment_ids(&self) -> &[u64] {
         &self.segment_ids
     }
@@ -1164,9 +1184,10 @@ impl<S: Store> SegmentedStore<S> {
     /// not a compatibility proof; put full algorithm/config/input fingerprints in
     /// the sidecar bytes and rebuild from the raw segment when they mismatch. Use
     /// with [`Self::dir`] to persist/load a built index that segstore GCs in
-    /// lockstep with the segment.
+    /// lockstep with the segment. Reader/searcher code that only has a [`View`]
+    /// can use the module-level [`try_index_name`] helper with [`View::segment_ids`].
     pub fn try_index_name(&self, id: u64, kind: &str) -> PersistenceResult<String> {
-        index_sidecar_name(id, kind)
+        try_index_name(id, kind)
     }
 
     /// Infallible convenience wrapper around [`Self::try_index_name`].
@@ -2081,11 +2102,26 @@ mod tests {
         let s = SegmentedStore::open(dir, Kv, 2).unwrap();
 
         assert_eq!(
-            s.try_index_name(7, "hnsw_v1-fast").unwrap(),
+            try_index_name(7, "hnsw_v1-fast").unwrap(),
             "segstore.idx.7.hnsw_v1-fast"
+        );
+        assert_eq!(
+            s.try_index_name(7, "hnsw_v1-fast").unwrap(),
+            try_index_name(7, "hnsw_v1-fast").unwrap()
+        );
+        assert_eq!(
+            s.index_name(7, "hnsw_v1-fast"),
+            index_name(7, "hnsw_v1-fast")
         );
 
         for kind in ["", "hnsw.v1", "hnsw/tmp", "../hnsw", ".tmp", "hnsw tmp"] {
+            assert!(
+                matches!(
+                    try_index_name(7, kind),
+                    Err(PersistenceError::InvalidConfig(_))
+                ),
+                "kind {kind:?} should be rejected by the free helper"
+            );
             assert!(
                 matches!(
                     s.try_index_name(7, kind),
@@ -2099,6 +2135,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid segstore index kind")]
     fn index_name_panics_on_invalid_kind() {
+        let _ = index_name(7, "hnsw.v1");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid segstore index kind")]
+    fn store_index_name_panics_on_invalid_kind() {
         let dir = MemoryDirectory::arc();
         let s = SegmentedStore::open(dir, Kv, 2).unwrap();
         let _ = s.index_name(7, "hnsw.v1");

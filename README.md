@@ -84,7 +84,8 @@ the Lucene `SearcherManager` / Tantivy `Searcher` model, made light by segstore'
 in-memory segments (a `View` is `Arc` clones; an old segment's memory frees when
 the last view holding it drops). Publishing only at the checkpoint keeps the
 snapshot off the ingest hot path -- republishing per write would make bulk ingest
-quadratic.
+quadratic. `View::segment_ids()` plus `try_index_name(id, kind)` lets readers load
+consumer sidecars without holding the writer.
 
 ## Examples
 

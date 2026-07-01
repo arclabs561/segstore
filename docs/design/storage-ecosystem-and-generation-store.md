@@ -89,6 +89,18 @@ format. It points to narrower per-consumer work:
   billion-scale SPLADE work use pruned first-stage vectors plus top-k query-term
   selection, Latent Terms extracts BM25-ready sparse vocabularies from dense
   retrievers, and GPUSparse treats exact sparse scoring as batched scatter-add.
+  A follow-up pass added two useful constraints: CSPLADE keeps the sparse
+  lexical vector and inverted-index shape while swapping in causal language
+  models, and CSRv2 points the opposite way, toward ultra-sparse embeddings with
+  2, 4, or 16 active dimensions. That makes the `postings` workload bimodal:
+  preserve very fast single/short sparse-vector queries, and separately design
+  block-max or WAND metadata for long, high-DF SPLADE-style expansions.
+- Rust inverted-index prior art is getting closer to this split. RISE exposes
+  compressed postings representations (Elias-Fano, partitioned Elias-Fano,
+  binary interpolative coding, and Stream VByte) plus DAAT, WAND, MaxScore, and
+  block-max variants. That argues against inventing a generic store first:
+  codec choice, block boundaries, and score upper bounds are query-engine
+  metadata that should be validated by `postings` or `sporse` benchmarks.
 - Late interaction: ColBERT-family models, LEMUR, Col-Bandit, FastLane, SLIM,
   SPLATE, ConstBERT, and sparse-coding variants need MaxSim or MaxSim-like
   candidate/rerank APIs. They should not be forced through a plain postings
@@ -314,14 +326,18 @@ artifact lifecycle crate.
    four segstore-backed consumers above have restart sidecars. A follow-up
    `postings` pass added learned-sparse and positional benchmark coverage, then
    sped up positional phrase and unordered NEAR by removing per-candidate
-   shifted-list allocation and string-keyed hash counting.
+   shifted-list allocation and string-keyed hash counting. A later measured
+   pass sped up single-term, short expanded, dense disjunctive, balanced
+   conjunctive, and ordered-proximity paths without changing storage format.
 2. Add Block-Max or Block-Max-MaxScore style learned-sparse primitives to
    `postings` only after the simpler measured forks are exhausted. The current
    benchmark says expanded high-DF queries and sparse external doc ids dominate:
    first compare the `HashMap` sparse-doc-id fallback against a sort/reduce
    accumulator, then prototype query-term masking or block maxima only if the
-   exact weighted scorer remains the bottleneck. Keep `sporse`'s WAND path
-   independent unless a shared primitive removes real duplication.
+   exact weighted scorer remains the bottleneck. CSRv2-style ultra-sparse
+   embeddings also mean rare and single-list paths are not legacy corner cases.
+   Keep `sporse`'s WAND path independent unless a shared primitive removes real
+   duplication.
 3. Release the `vicinity` sidecar path before moving `precinct`. Done:
    `vicinity 0.10.5` exposes graph postcard persistence under `persistence`, and
    `precinct` uses a region-aware sidecar format rather than a vector-only one.
@@ -404,6 +420,11 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
 - OCI descriptor spec: checked descriptor fields and digest rules. The useful
   portable minimum is still media type, digest string, and byte size, with
   SHA-256 required for compliant descriptor verification.
+- Postings/top-k addendum: read the abstract through Section 4 of Wang and
+  Suel's document-reordering paper, the abstract through Section 5 of Fontoura
+  et al.'s memory-resident top-k paper plus a targeted Section 7 extraction,
+  and targeted extractions from Block-Max WAND/BMM, RISE, CSPLADE, and CSRv2.
+  I did not read every cited compression, WAND, or learned-sparse reference.
 
 ## Research Sources
 
@@ -446,6 +467,21 @@ Provisional preference: `matlog`, `digest-store`, and `genstore`.
   <https://arxiv.org/abs/2404.13950>,
   <https://arxiv.org/abs/2606.05568>, and
   <https://arxiv.org/abs/2404.14989>
+- Postings and learned-sparse addendum: document reordering optimizes
+  intersection speed separately from compressed size; memory-resident top-k
+  work favors CPU-aware WAND/MaxScore variants and short-query/long-query
+  staging; Block-Max WAND needs per-block upper-bound metadata; RISE is current
+  Rust prior art for compressed postings plus WAND/MaxScore/BMW; CSPLADE keeps
+  sparse lexical inverted indexes alive with causal language models; CSRv2
+  points to ultra-sparse 2 to 16 active-dimension retrieval. These sources
+  support treating `postings` query metadata as an algorithm artifact, not a
+  generic generation-store feature.
+  <https://research.engineering.nyu.edu/~suel/papers/inter-vldb19.pdf>,
+  <http://www.vldb.org/pvldb/vol4/p1213-fontoura.pdf>,
+  <https://research.engineering.nyu.edu/~suel/papers/bmm.pdf>,
+  <https://arxiv.org/html/2606.07187v1>,
+  <https://arxiv.org/html/2504.10816v1>, and
+  <https://arxiv.org/html/2602.05735v4>
 - Dynamic vector-index pressure beyond HNSW: IVF-TQ and LSM-VEC show that
   trained codebooks, graph topology, raw vectors, and residual encodings age at
   different rates under streaming updates. That strengthens the case for

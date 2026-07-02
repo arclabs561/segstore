@@ -73,6 +73,10 @@ optional mmap helper; the missing piece is a segstore API that keeps the
 manifest/GC/checkpoint guarantees while letting consumers stream or map their own
 segment formats.
 
+`SegmentCatalog` can inspect the checkpoint manifest without decoding segment
+payload files, but it is a catalog helper for loaders and diagnostics, not a
+byte-native query reader.
+
 ## Compaction
 
 `compact()` merges all segments into one and purges tombstones.

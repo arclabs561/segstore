@@ -144,6 +144,29 @@ fn seg_path(id: u64) -> String {
     format!("{SEG_PREFIX}{id}")
 }
 
+fn reject_legacy_formats(dir: &dyn Directory) -> PersistenceResult<()> {
+    // A 0.1 store wrote a single unsuffixed WAL; later formats are epoch-suffixed.
+    // Reject it explicitly rather than misread its ops as an epoch.
+    if dir.exists(LEGACY_WAL_PATH) {
+        return Err(PersistenceError::InvalidConfig(
+            "segstore 0.1 on-disk store detected (unsuffixed segstore.wal); the \
+             on-disk format is epoch-suffixed and cannot read it"
+                .into(),
+        ));
+    }
+    // A 0.2 store wrote one monolithic segstore.ckpt blob; 0.3 uses a manifest
+    // + per-segment files. A ckpt with no manifest is a 0.2 store; reject it
+    // rather than ignore the data it holds.
+    if dir.exists(LEGACY_CKPT_PATH) && !dir.exists(MANIFEST_PATH) {
+        return Err(PersistenceError::InvalidConfig(
+            "segstore 0.2 on-disk store detected (monolithic segstore.ckpt); the 0.3 \
+             on-disk format is a manifest + per-segment files and cannot read it"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reserved prefix for consumer-written per-segment index sidecar files
 /// (`segstore.idx.<id>.<kind>`). A consumer persists a built per-segment index
 /// (an HNSW graph, posting lists, ...) here keyed by a stable segment id; segstore
@@ -389,6 +412,137 @@ struct PubState<S: Store> {
     tombstones: Arc<HashSet<S::Id>>,
 }
 
+/// Checkpointed segment metadata without deserializing segment payloads.
+///
+/// `SegmentCatalog` is a manifest reader, not an out-of-core query engine. It
+/// exposes the segment ids and tombstones named by the last checkpoint so a
+/// consumer can find segment files or sidecars without opening a
+/// [`SegmentedStore`] writer, but the current `segstore.seg.<id>` payloads are
+/// still checkpoint-wrapped encodings of `Store::Segment`.
+pub struct SegmentCatalog<Id> {
+    dir: Arc<dyn Directory>,
+    epoch: u64,
+    next_segment_id: u64,
+    segment_ids: Vec<u64>,
+    tombstones: HashSet<Id>,
+}
+
+impl<Id> SegmentCatalog<Id>
+where
+    Id: Eq + Hash + DeserializeOwned,
+{
+    /// Open the last checkpoint manifest without reading any segment files.
+    ///
+    /// Visibility matches [`Reader::view`]: this reflects only the most recent
+    /// checkpoint. WAL suffix records after that checkpoint are not exposed
+    /// because they have not been sealed into immutable segment files.
+    pub fn open(dir: Arc<dyn Directory>) -> PersistenceResult<Self> {
+        reject_legacy_formats(&*dir)?;
+
+        let mut epoch = 0u64;
+        let mut next_segment_id = 0u64;
+        let mut segment_ids = Vec::new();
+        let mut tombstones = HashSet::new();
+        if dir.exists(MANIFEST_PATH) {
+            let ckpt = CheckpointFile::new(dir.clone());
+            let (e, manifest): (u64, Manifest<Id>) = ckpt.read_postcard(MANIFEST_PATH)?;
+            epoch = e;
+            next_segment_id = manifest.next_seg_id;
+            segment_ids = manifest.segment_ids;
+            tombstones = manifest.tombstones.into_iter().collect();
+        }
+
+        Ok(Self {
+            dir,
+            epoch,
+            next_segment_id,
+            segment_ids,
+            tombstones,
+        })
+    }
+
+    /// WAL epoch covered by the checkpoint manifest.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Next segment id recorded in the manifest.
+    pub fn next_segment_id(&self) -> u64 {
+        self.next_segment_id
+    }
+
+    /// Stable ids of the checkpointed immutable segments, oldest first.
+    pub fn segment_ids(&self) -> &[u64] {
+        &self.segment_ids
+    }
+
+    /// Number of checkpointed immutable segments.
+    pub fn segment_count(&self) -> usize {
+        self.segment_ids.len()
+    }
+
+    /// Number of tombstoned ids in the checkpoint.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
+    }
+
+    /// Whether `id` is not tombstoned in this checkpoint.
+    pub fn is_live(&self, id: &Id) -> bool {
+        !self.tombstones.contains(id)
+    }
+
+    /// The directory backing this catalog.
+    pub fn dir(&self) -> &Arc<dyn Directory> {
+        &self.dir
+    }
+
+    /// Segment file name for `id`, if the checkpoint names that segment.
+    pub fn segment_name(&self, id: u64) -> PersistenceResult<String> {
+        self.ensure_segment_id(id)?;
+        Ok(seg_path(id))
+    }
+
+    /// Filesystem path for `id`, if this directory exposes paths.
+    pub fn segment_file_path(&self, id: u64) -> PersistenceResult<Option<std::path::PathBuf>> {
+        Ok(self.dir.file_path(&self.segment_name(id)?))
+    }
+
+    /// Open the raw segment file for `id`.
+    ///
+    /// The returned file is the current segstore segment file, including its
+    /// durability checkpoint envelope. This method intentionally does not decode
+    /// `Store::Segment`; consumers that need byte-native segments need the raw
+    /// segment API described in `docs/design/out-of-core-segment-reader.md`.
+    pub fn open_segment_file(&self, id: u64) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
+        self.dir.open_file(&self.segment_name(id)?)
+    }
+
+    /// Reserved sidecar file name for a per-segment index of the given `kind`.
+    pub fn try_index_name(&self, id: u64, kind: &str) -> PersistenceResult<String> {
+        self.ensure_segment_id(id)?;
+        try_index_name(id, kind)
+    }
+
+    /// Infallible convenience wrapper around [`Self::try_index_name`].
+    ///
+    /// Panics if `id` is not in this catalog or `kind` violates the documented
+    /// sidecar-kind grammar.
+    pub fn index_name(&self, id: u64, kind: &str) -> String {
+        self.try_index_name(id, kind)
+            .unwrap_or_else(|e| panic!("invalid segstore catalog index name: {e}"))
+    }
+
+    fn ensure_segment_id(&self, id: u64) -> PersistenceResult<()> {
+        if self.segment_ids.contains(&id) {
+            Ok(())
+        } else {
+            Err(PersistenceError::NotFound(format!(
+                "segment id {id} is not in the checkpoint manifest"
+            )))
+        }
+    }
+}
+
 /// A consistent, point-in-time read view of the store, independent of the writer.
 ///
 /// A [`Reader`] hands these out; holding one keeps its segments alive for the whole
@@ -531,25 +685,7 @@ impl<S: Store> SegmentedStore<S> {
                 "SyncPolicy::Fsync requires a filesystem-backed Directory".into(),
             ));
         }
-        // A 0.1 store wrote a single unsuffixed WAL; later formats are epoch-suffixed.
-        // Reject it explicitly rather than misread its ops as an epoch.
-        if dir.exists(LEGACY_WAL_PATH) {
-            return Err(PersistenceError::InvalidConfig(
-                "segstore 0.1 on-disk store detected (unsuffixed segstore.wal); the \
-                 on-disk format is epoch-suffixed and cannot read it"
-                    .into(),
-            ));
-        }
-        // A 0.2 store wrote one monolithic segstore.ckpt blob; 0.3 uses a manifest
-        // + per-segment files. A ckpt with no manifest is a 0.2 store; reject it
-        // rather than ignore the data it holds.
-        if dir.exists(LEGACY_CKPT_PATH) && !dir.exists(MANIFEST_PATH) {
-            return Err(PersistenceError::InvalidConfig(
-                "segstore 0.2 on-disk store detected (monolithic segstore.ckpt); the 0.3 \
-                 on-disk format is a manifest + per-segment files and cannot read it"
-                    .into(),
-            ));
-        }
+        reject_legacy_formats(&*dir)?;
 
         // Load the manifest if one exists. It records the WAL epoch it covers (in
         // the CheckpointFile header) and names the current segment files; recovery
@@ -2213,6 +2349,69 @@ mod tests {
             "a CRC-corrupt segment file is an error, not silently misread"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn segment_catalog_reads_manifest_without_decoding_segments() {
+        let root = temp_root("segment-catalog");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.add(3, "c".into()).unwrap();
+            s.add(4, "d".into()).unwrap();
+            s.delete(2).unwrap();
+            s.checkpoint().unwrap();
+        }
+
+        // Corrupt one segment file. Opening the full store must reject it, but
+        // opening the catalog should still succeed because it reads only the
+        // manifest. This is the narrow diagnostic/catalog step, not a query reader.
+        let seg = root.join(seg_path(0));
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let res = SegmentedStore::open(dir.clone(), Kv, 2);
+        assert!(
+            res.is_err(),
+            "full store open decodes segment payloads and rejects corruption"
+        );
+
+        let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+        assert_eq!(catalog.epoch(), 1);
+        assert_eq!(catalog.segment_ids(), &[0, 1]);
+        assert_eq!(catalog.segment_count(), 2);
+        assert_eq!(catalog.tombstone_count(), 1);
+        assert!(catalog.is_live(&1));
+        assert!(!catalog.is_live(&2));
+        assert_eq!(catalog.segment_name(1).unwrap(), seg_path(1));
+        assert_eq!(
+            catalog.try_index_name(1, "toy").unwrap(),
+            "segstore.idx.1.toy"
+        );
+        assert!(matches!(
+            catalog.segment_name(99),
+            Err(PersistenceError::NotFound(_))
+        ));
+        assert!(catalog.open_segment_file(1).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn segment_catalog_rejects_legacy_formats() {
+        let dir = MemoryDirectory::arc();
+        dir.atomic_write(LEGACY_CKPT_PATH, b"a 0.2 checkpoint blob")
+            .unwrap();
+        let err = SegmentCatalog::<u32>::open(dir);
+        assert!(
+            matches!(err, Err(PersistenceError::InvalidConfig(_))),
+            "legacy monolithic checkpoints are rejected consistently"
+        );
     }
 
     #[test]

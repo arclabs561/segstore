@@ -16,6 +16,10 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Added
 
+- `SegmentCatalog<Id>` for reading the checkpoint manifest without decoding
+  segment payload files. It exposes stable segment ids, tombstone checks, segment
+  file names/paths, and sidecar names for diagnostic and restart-time loader
+  code. This is a catalog helper, not yet a byte-native out-of-core query API.
 - Module-level `try_index_name(id, kind)` and `index_name(id, kind)` helpers so
   reader/searcher code can load sidecars from `View::segment_ids()` without
   holding a writer `SegmentedStore`.

@@ -529,6 +529,21 @@ where
         self.dir.open_file(&self.segment_name(id)?)
     }
 
+    /// Decode one checkpointed segment by id.
+    ///
+    /// This is a bounded restart/build helper: it decodes only the requested
+    /// segment file instead of opening a full [`SegmentedStore`] and decoding
+    /// every segment in the manifest. It is still a whole-segment postcard decode,
+    /// not a byte-native or mmap-backed query reader.
+    pub fn read_segment<Segment>(&self, id: u64) -> PersistenceResult<Segment>
+    where
+        Segment: DeserializeOwned,
+    {
+        let ckpt = CheckpointFile::new(self.dir.clone());
+        let (_, segment) = ckpt.read_postcard(&self.segment_name(id)?)?;
+        Ok(segment)
+    }
+
     /// Reserved sidecar file name for a per-segment index of the given `kind`.
     pub fn try_index_name(&self, id: u64, kind: &str) -> PersistenceResult<String> {
         self.ensure_segment_id(id)?;
@@ -2489,6 +2504,12 @@ mod tests {
             Err(PersistenceError::NotFound(_))
         ));
         assert!(catalog.open_segment_file(1).is_ok());
+        let seg1: Vec<(u32, String)> = catalog.read_segment(1).unwrap();
+        assert_eq!(seg1, vec![(3, "c".into()), (4, "d".into())]);
+        assert!(
+            catalog.read_segment::<Vec<(u32, String)>>(0).is_err(),
+            "reading the corrupt segment should fail when that segment is requested"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3422,6 +3443,7 @@ mod tests {
                 for &seg_id in catalog.segment_ids() {
                     prop_assert_eq!(catalog.segment_name(seg_id).unwrap(), seg_path(seg_id));
                     prop_assert!(catalog.open_segment_file(seg_id).is_ok());
+                    let _: Vec<(u32, String)> = catalog.read_segment(seg_id).unwrap();
                 }
                 prop_assert!(matches!(
                     catalog.segment_name(u64::MAX),

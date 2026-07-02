@@ -53,8 +53,8 @@ put an ANN graph inside each segment and merge per-segment top-k results.
 ### `persist_index`: can a consumer cache built per-segment indices?
 
 Builds a toy sorted sidecar for each segment, writes it under segstore's
-reserved index-sidecar name, reopens the store, then loads the sidecars instead
-of rebuilding them.
+reserved index-sidecar name, opens the manifest catalog, then loads the sidecars
+instead of rebuilding them. A missing or stale sidecar decodes only that segment.
 
 ```bash
 cargo run --release --example persist_index
@@ -62,7 +62,7 @@ cargo run --release --example persist_index
 
 ```text
 built + persisted 10 per-segment index sidecars
-reopen over 10 segments: rebuild-all 196.209µs vs load-all 304.5µs
+catalog reopen over 10 segments: rebuild-all 164.542µs vs load-all 438.458µs
   rebuilt invalid/missing sidecars: 0
   [PASS] persisted indices load on reopen instead of rebuilding
   (the win scales with build cost; a real HNSW build dwarfs this toy build)

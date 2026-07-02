@@ -74,8 +74,9 @@ manifest/GC/checkpoint guarantees while letting consumers stream or map their ow
 segment formats.
 
 `SegmentCatalog` can inspect the checkpoint manifest without decoding segment
-payload files, but it is a catalog helper for loaders and diagnostics, not a
-byte-native query reader.
+payload files, and can decode one requested segment for sidecar rebuilds. It is
+still a catalog helper for loaders and diagnostics, not a byte-native query
+reader.
 
 ## Compaction
 

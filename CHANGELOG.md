@@ -25,6 +25,9 @@ unstable: minor bumps may break the public API and the on-disk format.
   segment payload files. It exposes stable segment ids, tombstone checks, segment
   file names/paths, and sidecar names for diagnostic and restart-time loader
   code. This is a catalog helper, not yet a byte-native out-of-core query API.
+- `SegmentCatalog::read_segment(id)` for decoding one checkpointed segment by
+  stable id, so restart-time sidecar builders can load only the segment they
+  need instead of opening the full in-memory store.
 - Module-level `try_index_name(id, kind)` and `index_name(id, kind)` helpers so
   reader/searcher code can load sidecars from `View::segment_ids()` without
   holding a writer `SegmentedStore`.

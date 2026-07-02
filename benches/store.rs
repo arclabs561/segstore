@@ -411,7 +411,9 @@ fn bench_recovery_blob(c: &mut Criterion) {
 /// Open only the checkpoint manifest catalog vs fully opening the store and
 /// decoding every segment. This is the narrow performance claim behind
 /// `SegmentCatalog`: it is useful for diagnostics and loader planning, but it is
-/// not yet a byte-native query reader.
+/// not yet a byte-native query reader. The one-segment read arm guards the
+/// sidecar fallback path: missing or stale sidecars should decode the segment
+/// they rebuild, not force a full store open.
 fn bench_segment_catalog_open(c: &mut Criterion) {
     let mut g = c.benchmark_group("open_catalog_vs_full_blob_512B");
     for &n in &[1_000u32, 4_000] {
@@ -437,6 +439,18 @@ fn bench_segment_catalog_open(c: &mut Criterion) {
                 criterion::black_box(catalog.segment_count());
             });
         });
+        let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+        let first_id = catalog.segment_ids()[0];
+        g.bench_with_input(
+            BenchmarkId::new("catalog_read_one_segment", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let segment: Vec<(u32, Vec<u8>)> = catalog.read_segment(first_id).unwrap();
+                    criterion::black_box(segment.len());
+                });
+            },
+        );
     }
     g.finish();
 }

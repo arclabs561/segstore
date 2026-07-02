@@ -9,7 +9,7 @@
 //!
 //! The sidecar here is raw little-endian bytes with a consumer-owned
 //! magic/version/recipe/count header. segstore never reads it; missing or invalid
-//! sidecars are rebuilt from the raw segment.
+//! sidecars are rebuilt from that segment through `SegmentCatalog::read_segment`.
 //!
 //! Run: `cargo run --example persist_index`
 
@@ -17,7 +17,7 @@ use std::io::Read;
 use std::time::Instant;
 
 use durability::FsDirectory;
-use segstore::{SegmentedStore, Store};
+use segstore::{SegmentCatalog, SegmentedStore, Store};
 
 const SIDE_MAGIC: &[u8; 8] = b"SIDXDEMO";
 const SIDE_VERSION: u32 = 1;
@@ -155,22 +155,27 @@ fn main() {
         );
     } // drop: simulate a process restart
 
-    // Reopen. Time loading the sidecars vs rebuilding from the raw segments.
+    // Reopen the full store only for the comparison baseline: rebuilding every
+    // index still has to decode every segment.
     let dir = FsDirectory::arc(&root).unwrap();
     let s = SegmentedStore::open(dir.clone(), Kv, 2_000).unwrap();
 
     let t = Instant::now();
     let rebuilt: Vec<Vec<(u64, u32)>> = s.segments().iter().map(|seg| build_index(seg)).collect();
     let rebuild = t.elapsed();
+    drop(s);
 
+    // The sidecar loader path does not open `SegmentedStore`, so it does not
+    // decode all segment payloads up front. A missing/stale sidecar pays only for
+    // the segment it must rebuild.
+    let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
     let t = Instant::now();
     let mut rebuilt_sidecars = 0usize;
-    let loaded: Vec<Vec<(u64, u32)>> = s
+    let loaded: Vec<Vec<(u64, u32)>> = catalog
         .segment_ids()
         .iter()
-        .enumerate()
-        .map(|(idx, &id)| {
-            let name = s.index_name(id, "demo");
+        .map(|&id| {
+            let name = catalog.index_name(id, "demo");
             let mut bytes = Vec::new();
             let loaded = dir
                 .open_file(&name)
@@ -182,7 +187,8 @@ fn main() {
                 .and_then(|_| decode(&bytes).ok());
             loaded.unwrap_or_else(|| {
                 rebuilt_sidecars += 1;
-                build_index(&s.segments()[idx])
+                let segment: Vec<(u32, u64)> = catalog.read_segment(id).unwrap();
+                build_index(&segment)
             })
         })
         .collect();
@@ -193,7 +199,7 @@ fn main() {
         "the loaded index must equal a fresh rebuild"
     );
     println!(
-        "reopen over {} segments: rebuild-all {rebuild:?} vs load-all {load:?}",
+        "catalog reopen over {} segments: rebuild-all {rebuild:?} vs load-all {load:?}",
         rebuilt.len()
     );
     println!("  rebuilt invalid/missing sidecars: {rebuilt_sidecars}");

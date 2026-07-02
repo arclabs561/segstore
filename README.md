@@ -73,10 +73,10 @@ optional mmap helper; the missing piece is a segstore API that keeps the
 manifest/GC/checkpoint guarantees while letting consumers stream or map their own
 segment formats.
 
-`SegmentCatalog` can inspect the checkpoint manifest without decoding segment
-payload files, and can decode one requested segment for sidecar rebuilds. It is
-still a catalog helper for loaders and diagnostics, not a byte-native query
-reader.
+`SegmentCatalog` can inspect the checkpoint manifest without opening segment
+payload files, read one segment's validated serialized payload bytes, or decode
+one requested segment for sidecar rebuilds. It is still a catalog helper for
+loaders and diagnostics, not a byte-native query reader.
 
 ## Compaction
 

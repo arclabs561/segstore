@@ -451,6 +451,16 @@ fn bench_segment_catalog_open(c: &mut Criterion) {
                 });
             },
         );
+        g.bench_with_input(
+            BenchmarkId::new("catalog_read_one_payload", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let payload = catalog.read_segment_payload(first_id).unwrap();
+                    criterion::black_box(payload.len());
+                });
+            },
+        );
     }
     g.finish();
 }

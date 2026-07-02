@@ -44,6 +44,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 - `SegmentCatalog::read_segment(id)` for decoding one checkpointed segment by
   stable id, so restart-time sidecar builders can load only the segment they
   need instead of opening the full in-memory store.
+- `SegmentCatalog::read_segment_payload(id)` for reading one segment's
+  CRC-validated serialized payload bytes without deserializing `Store::Segment`.
 - Module-level `try_index_name(id, kind)` and `index_name(id, kind)` helpers so
   reader/searcher code can load sidecars from `View::segment_ids()` without
   holding a writer `SegmentedStore`.

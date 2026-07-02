@@ -112,9 +112,10 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::io::Read;
 use std::sync::Arc;
 
-use durability::checkpoint::CheckpointFile;
+use durability::checkpoint::{CheckpointFile, MAX_CHECKPOINT_PAYLOAD_BYTES};
 use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter};
 use durability::{Directory, PersistenceError, PersistenceResult};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -133,6 +134,8 @@ const MANIFEST_PATH: &str = "segstore.manifest";
 /// Prefix for per-segment files (`segstore.seg.<id>`); each holds one immutable
 /// segment, written once and never rewritten.
 const SEG_PREFIX: &str = "segstore.seg.";
+const CHECKPOINT_MAGIC: [u8; 4] = *b"VCKP";
+const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 
 /// The WAL file path for a given epoch.
 fn wal_path(epoch: u64) -> String {
@@ -221,6 +224,46 @@ fn delete_files_best_effort(dir: &dyn Directory, names: Vec<String>, durable: bo
     if durable && deleted {
         let _ = dir.durable_sync_parent_dir(MANIFEST_PATH);
     }
+}
+
+fn read_checkpoint_payload(dir: &dyn Directory, path: &str) -> PersistenceResult<Vec<u8>> {
+    let mut f = dir.open_file(path)?;
+    let mut buf4 = [0u8; 4];
+    let mut buf8 = [0u8; 8];
+
+    f.read_exact(&mut buf4)?;
+    if buf4 != CHECKPOINT_MAGIC {
+        return Err(PersistenceError::Format("invalid checkpoint magic".into()));
+    }
+
+    f.read_exact(&mut buf4)?;
+    let version = u32::from_le_bytes(buf4);
+    if version != CHECKPOINT_FORMAT_VERSION {
+        return Err(PersistenceError::Format(
+            "checkpoint version mismatch".into(),
+        ));
+    }
+
+    f.read_exact(&mut buf8)?; // last_applied_id is not used for segment payload reads.
+    f.read_exact(&mut buf8)?;
+    let len = usize::try_from(u64::from_le_bytes(buf8))
+        .map_err(|_| PersistenceError::Format("payload_len overflow".into()))?;
+    if len > MAX_CHECKPOINT_PAYLOAD_BYTES {
+        return Err(PersistenceError::Format(format!(
+            "checkpoint payload too large: {} bytes (max {})",
+            len, MAX_CHECKPOINT_PAYLOAD_BYTES
+        )));
+    }
+
+    f.read_exact(&mut buf4)?;
+    let expected = u32::from_le_bytes(buf4);
+    let mut payload = vec![0u8; len];
+    f.read_exact(&mut payload)?;
+    let actual = crc32fast::hash(&payload);
+    if actual != expected {
+        return Err(PersistenceError::CrcMismatch { expected, actual });
+    }
+    Ok(payload)
 }
 
 /// The reserved sidecar file name for a consumer's per-segment built index.
@@ -527,6 +570,16 @@ where
     /// segment API described in `docs/design/out-of-core-segment-reader.md`.
     pub fn open_segment_file(&self, id: u64) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
         self.dir.open_file(&self.segment_name(id)?)
+    }
+
+    /// Read one checkpointed segment's CRC-validated serialized payload bytes.
+    ///
+    /// This avoids opening a full [`SegmentedStore`] and avoids deserializing
+    /// `Store::Segment`, but it is still a whole-payload read of the postcard
+    /// bytes that segstore wrote for that segment. It is a loader/build helper,
+    /// not a streaming or mmap-backed query reader.
+    pub fn read_segment_payload(&self, id: u64) -> PersistenceResult<Vec<u8>> {
+        read_checkpoint_payload(&*self.dir, &self.segment_name(id)?)
     }
 
     /// Decode one checkpointed segment by id.
@@ -2506,8 +2559,17 @@ mod tests {
             Err(PersistenceError::NotFound(_))
         ));
         assert!(catalog.open_segment_file(1).is_ok());
+        let payload = catalog.read_segment_payload(1).unwrap();
+        assert!(
+            !payload.is_empty(),
+            "payload bytes are available without decoding"
+        );
         let seg1: Vec<(u32, String)> = catalog.read_segment(1).unwrap();
         assert_eq!(seg1, vec![(3, "c".into()), (4, "d".into())]);
+        assert!(
+            catalog.read_segment_payload(0).is_err(),
+            "payload reads still validate the segment checkpoint CRC"
+        );
         assert!(
             catalog.read_segment::<Vec<(u32, String)>>(0).is_err(),
             "reading the corrupt segment should fail when that segment is requested"

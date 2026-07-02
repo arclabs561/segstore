@@ -7,7 +7,7 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use durability::MemoryDirectory;
-use segstore::{Options, SegmentedStore, Store};
+use segstore::{Options, SegmentCatalog, SegmentedStore, Store};
 
 struct Kv;
 impl Store for Kv {
@@ -361,6 +361,39 @@ fn bench_recovery_blob(c: &mut Criterion) {
     g.finish();
 }
 
+/// Open only the checkpoint manifest catalog vs fully opening the store and
+/// decoding every segment. This is the narrow performance claim behind
+/// `SegmentCatalog`: it is useful for diagnostics and loader planning, but it is
+/// not yet a byte-native query reader.
+fn bench_segment_catalog_open(c: &mut Criterion) {
+    let mut g = c.benchmark_group("open_catalog_vs_full_blob_512B");
+    for &n in &[1_000u32, 4_000] {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s =
+                SegmentedStore::open_with_options(dir.clone(), Blob, Options::new(256)).unwrap();
+            for i in 0..n {
+                s.add(i, vec![0u8; BLOB_BYTES]).unwrap();
+            }
+            s.checkpoint().unwrap();
+        }
+        g.bench_with_input(BenchmarkId::new("full_open", n), &n, |b, _| {
+            b.iter(|| {
+                let s = SegmentedStore::open_with_options(dir.clone(), Blob, Options::new(256))
+                    .unwrap();
+                criterion::black_box(s.segment_count());
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("catalog_open", n), &n, |b, _| {
+            b.iter(|| {
+                let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+                criterion::black_box(catalog.segment_count());
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_add,
@@ -372,6 +405,7 @@ criterion_group!(
     bench_compact_realistic,
     bench_sync_policy,
     bench_sidecar_gc_on_compact,
-    bench_recovery_blob
+    bench_recovery_blob,
+    bench_segment_catalog_open
 );
 criterion_main!(benches);

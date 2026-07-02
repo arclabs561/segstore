@@ -3175,6 +3175,38 @@ mod tests {
         ]
     }
 
+    #[derive(Debug, Clone)]
+    enum CatalogOp {
+        Add,
+        Delete(usize),
+        Checkpoint,
+        Compact,
+        CompactTiers,
+        Reopen,
+    }
+
+    fn catalog_op_strategy() -> impl Strategy<Value = CatalogOp> {
+        prop_oneof![
+            3 => Just(CatalogOp::Add),
+            2 => (0usize..100).prop_map(CatalogOp::Delete),
+            2 => Just(CatalogOp::Checkpoint),
+            1 => Just(CatalogOp::Compact),
+            1 => Just(CatalogOp::CompactTiers),
+            1 => Just(CatalogOp::Reopen),
+        ]
+    }
+
+    fn catalog_expectation(
+        s: &SegmentedStore<Kv>,
+    ) -> (u64, u64, Vec<u64>, std::collections::HashSet<u32>) {
+        (
+            s.epoch,
+            s.next_seg_id,
+            s.segment_ids.clone(),
+            s.tombstones.clone(),
+        )
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
         /// For any sequence of add/delete/compact/compact_tiers/reopen, the live set
@@ -3231,6 +3263,113 @@ mod tests {
             }
             let want: Vec<(u32, String)> = model.into_iter().collect();
             prop_assert_eq!(live_set(&s), want);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        /// The catalog is a manifest reader: it tracks the last checkpointed
+        /// segment ids/tombstones exactly, while ignoring WAL-only suffix records.
+        #[test]
+        fn segment_catalog_matches_last_checkpoint_under_random_ops(
+            ops in proptest::collection::vec(catalog_op_strategy(), 0..160)
+        ) {
+            let dir = MemoryDirectory::arc();
+            let cfg = TierConfig {
+                min_merge: 4,
+                max_merge: 8,
+                max_merged_len: 64,
+                ..Default::default()
+            };
+            let mk = || Options { tiering: cfg, ..Options::new(3) };
+            let mut s = SegmentedStore::open_with_options(dir.clone(), Kv, mk()).unwrap();
+            let mut checkpointed = catalog_expectation(&s);
+            let mut live_ids: Vec<u32> = Vec::new();
+            let mut next_id = 0u32;
+
+            for op in ops {
+                match op {
+                    CatalogOp::Add => {
+                        let id = next_id;
+                        next_id += 1;
+                        s.add(id, format!("v{id}")).unwrap();
+                        live_ids.push(id);
+                    }
+                    CatalogOp::Delete(k) => {
+                        if !live_ids.is_empty() {
+                            let id = live_ids.swap_remove(k % live_ids.len());
+                            s.delete(id).unwrap();
+                        }
+                    }
+                    CatalogOp::Checkpoint => {
+                        s.checkpoint().unwrap();
+                        checkpointed = catalog_expectation(&s);
+                    }
+                    CatalogOp::Compact => {
+                        s.compact().unwrap();
+                        checkpointed = catalog_expectation(&s);
+                    }
+                    CatalogOp::CompactTiers => {
+                        if s.compact_tiers().unwrap().merges > 0 {
+                            checkpointed = catalog_expectation(&s);
+                        }
+                    }
+                    CatalogOp::Reopen => {
+                        s = SegmentedStore::open_with_options(dir.clone(), Kv, mk()).unwrap();
+                    }
+                }
+
+                let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+                prop_assert_eq!(catalog.epoch(), checkpointed.0);
+                prop_assert_eq!(catalog.next_segment_id(), checkpointed.1);
+                prop_assert_eq!(catalog.segment_ids(), &checkpointed.2[..]);
+                prop_assert_eq!(catalog.segment_count(), checkpointed.2.len());
+                prop_assert_eq!(catalog.tombstone_count(), checkpointed.3.len());
+                for id in 0..next_id {
+                    prop_assert_eq!(catalog.is_live(&id), !checkpointed.3.contains(&id));
+                }
+                for &seg_id in catalog.segment_ids() {
+                    prop_assert_eq!(catalog.segment_name(seg_id).unwrap(), seg_path(seg_id));
+                    prop_assert!(catalog.open_segment_file(seg_id).is_ok());
+                }
+                prop_assert!(matches!(
+                    catalog.segment_name(u64::MAX),
+                    Err(PersistenceError::NotFound(_))
+                ));
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        /// Any single-byte manifest corruption must be detected before the
+        /// catalog exposes segment ids or tombstones.
+        #[test]
+        fn segment_catalog_rejects_manifest_corruption_at_any_byte(offset in 0usize..256) {
+            use std::io::Read;
+
+            let dir = MemoryDirectory::arc();
+            {
+                let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+                s.add(1, "a".into()).unwrap();
+                s.add(2, "b".into()).unwrap();
+                s.delete(1).unwrap();
+                s.checkpoint().unwrap();
+            }
+
+            let mut file = dir.open_file(MANIFEST_PATH).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            let header_len = durability::checkpoint::CheckpointHeader::SIZE;
+            prop_assume!(bytes.len() > header_len);
+            let i = header_len + (offset % (bytes.len() - header_len));
+            bytes[i] ^= 0x80;
+            dir.atomic_write(MANIFEST_PATH, &bytes).unwrap();
+
+            prop_assert!(
+                SegmentCatalog::<u32>::open(dir).is_err(),
+                "corrupt manifest byte {i} was accepted"
+            );
         }
     }
 }

@@ -9,6 +9,11 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Changed
 
+- `SegmentCatalog` now validates segment ids with binary search instead of a
+  linear scan. In the many-segment catalog benchmark, naming every segment moved
+  from `[979.29 us 983.18 us 988.99 us]` to
+  `[296.10 us 298.27 us 300.57 us]` for 4,000 segments, while catalog-open time
+  stayed flat.
 - Batched best-effort GC of stale WAL, segment, and index-sidecar files so
   filesystem-backed cleanup syncs the parent directory once per batch instead of
   leaving deletion durability to a later operation.

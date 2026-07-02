@@ -455,6 +455,44 @@ fn bench_segment_catalog_open(c: &mut Criterion) {
     g.finish();
 }
 
+/// Catalog helpers are used by sidecar loaders that walk every segment id on
+/// startup. A linear membership check inside each helper turns that path into
+/// O(segment_count^2), so this benchmark keeps the many-segment case visible.
+fn bench_segment_catalog_many_ids(c: &mut Criterion) {
+    let mut g = c.benchmark_group("segment_catalog_many_ids");
+    for &n in &[1_000u32, 4_000] {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s =
+                SegmentedStore::open_with_options(dir.clone(), Kv, Options::new(1)).unwrap();
+            fill(&mut s, n);
+            s.checkpoint().unwrap();
+        }
+        let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+        assert_eq!(catalog.segment_count(), n as usize);
+
+        g.bench_with_input(BenchmarkId::new("catalog_open", n), &n, |b, _| {
+            b.iter(|| {
+                let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+                criterion::black_box(catalog.segment_count());
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("segment_name_all", n), &n, |b, _| {
+            b.iter(|| {
+                let mut total = 0usize;
+                for &id in catalog.segment_ids() {
+                    total += catalog
+                        .segment_name(criterion::black_box(id))
+                        .unwrap()
+                        .len();
+                }
+                criterion::black_box(total);
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_add,
@@ -468,6 +506,7 @@ criterion_group!(
     bench_sidecar_gc_on_compact,
     bench_sidecar_gc_on_compact_fs,
     bench_recovery_blob,
-    bench_segment_catalog_open
+    bench_segment_catalog_open,
+    bench_segment_catalog_many_ids
 );
 criterion_main!(benches);

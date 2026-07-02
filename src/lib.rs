@@ -560,7 +560,9 @@ where
     }
 
     fn ensure_segment_id(&self, id: u64) -> PersistenceResult<()> {
-        if self.segment_ids.contains(&id) {
+        // Segment ids are allocated monotonically and kept oldest-first, so the
+        // manifest vector is sorted without an extra lookup structure.
+        if self.segment_ids.binary_search(&id).is_ok() {
             Ok(())
         } else {
             Err(PersistenceError::NotFound(format!(

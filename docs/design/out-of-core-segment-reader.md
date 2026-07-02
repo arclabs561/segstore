@@ -15,6 +15,12 @@ small embedded indexes and restart-stable sidecar caches, but it does not let
 `lexir`, `postings`, `sporse`, `vicinity`, or `precinct` search a corpus larger
 than memory.
 
+The actual requirement is broader than restart-time persistence. These crates
+need bounded memory across every stage: indexing, updating, deleting, searching,
+sidecar rebuild, compaction, and long-term maintenance. A design that only keeps
+startup fast by loading persisted sidecars still fails once the sidecars or raw
+segments themselves exceed RAM.
+
 The tempting fix is to expose `segstore.seg.<id>` paths. That is insufficient.
 Current segment files are `durability::CheckpointFile` envelopes containing a
 postcard-encoded `Store::Segment`. A consumer that needs mmap, byte ranges,
@@ -37,6 +43,29 @@ Existing local contracts:
 - `Store::Segment: Serialize + DeserializeOwned` is the current in-memory
   contract. It is the wrong place to hide disk-page layout.
 
+The backend matters. Some `durability` and `segstore` ideas only make sense for
+particular I/O classes:
+
+- Memory directory: useful for tests, fuzzing, examples, and deterministic crash
+  modeling. It has no fsync, mmap, page cache, true deletion durability, or
+  range I/O cost model. Performance numbers from it do not predict filesystem or
+  object-store behavior.
+- Local filesystem on SSD/NVMe: useful for WAL fsync, atomic rename, parent-dir
+  fsync, mmap, page-cache reuse, sequential compaction, and small random reads.
+  This is the first real out-of-core target.
+- Slow disks or network filesystems: similar API surface, but random I/O, sync
+  costs, and sometimes rename/fsync semantics differ from local SSDs. Treat these
+  as explicit backend targets. Search readers need larger blocks, prefetch,
+  batching, and fewer metadata round trips.
+- Object store: useful for immutable blobs, conditional publish, bulk/range
+  reads, vectored reads, multipart writes, and generation manifests. It does not
+  behave like a seekable file with cheap per-query random reads. Search over
+  object storage needs large coalesced ranges and a different cache policy.
+
+That argues for capability-driven APIs, not a single `Directory` performance
+story. `segstore` should keep the local crash-consistency contract small while
+making it possible to add range/vectored/object-store capabilities later.
+
 External evidence points the same way:
 
 - Tantivy searchers hold snapshots of immutable segment readers, and its on-disk
@@ -46,11 +75,20 @@ External evidence points the same way:
 - Rust `object_store` exposes backend capabilities such as conditional writes,
   range reads, and vectored reads. Those are backend-access primitives, not a
   search-index data model:
-  <https://github.com/apache/arrow-rs-object-store/blob/main/_autodocs/api-reference/objectstore-core.md>.
+  <https://docs.rs/object_store>.
 - Disk ANN work such as SPANN keeps centroids in memory and large posting lists
   on disk, while DiskANN-family work makes page and graph layout part of the
   algorithm. This argues for consumer-owned bytes and metadata, not a generic
   `DeserializeOwned` segment.
+- Learned-sparse retrieval work keeps the inverted index central but adds
+  Block-Max pruning, query-term pruning, and high-document-frequency term
+  handling. That belongs in `postings`/`sporse` byte layouts, not in `segstore`:
+  <https://arxiv.org/html/2405.01117v1>.
+- RISE shows current Rust inverted-index prior art with compressed postings,
+  DAAT, WAND, MaxScore, and Block-Max variants. This raises the bar for
+  `postings`: a raw segment format should carry block metadata and compression
+  choices explicitly, not through a generic store wrapper:
+  <https://arxiv.org/html/2606.07187v1>.
 
 ## Non-Goals
 
@@ -171,6 +209,57 @@ The implementation can still open files or mmaps under the hood, but the public
 invariant is pin-based. This matters for Windows and for consumers that open
 sidecars lazily after creating a view.
 
+### Phase 4: Backend capabilities
+
+Only after a filesystem raw reader works should `segstore` grow backend
+capabilities. The likely split is:
+
+- whole-file access: current `Directory`, enough for manifests, WALs, raw
+  segment writes, sidecars, and small local tests;
+- filesystem path access: enables mmap and page-cache-driven readers;
+- range access: reads byte ranges without decoding the full segment;
+- vectored range access: coalesces many small posting/page reads into fewer I/O
+  operations;
+- conditional publish: needed for object-store generation pointers and
+  multi-writer-safe artifact publication, not for the current single-writer
+  local `SegmentedStore`.
+
+Do not fake these capabilities on backends where their cost model is different.
+For example, an in-memory range read can test correctness but says nothing about
+whether query-time random reads are acceptable on SSD or object storage.
+
+## Per-Consumer Consequences
+
+- `postings`: first raw-segment target. It needs term dictionaries, compressed
+  doc-id blocks, frequencies, positions, skip/block-max metadata, and optional
+  impact-score upper bounds in byte-native files. Massive lexical search should
+  keep dictionaries and small metadata hot, then page posting and position
+  blocks as queries demand them.
+- `lexir`: should sit above `postings`, not grow a second Lucene-like storage
+  engine. Its materialized-log CLI path is useful for operation replay and
+  maintenance commands, but large lexical search should use postings segment
+  readers with corpus statistics and scoring policy layered on top.
+- `sporse`: current WAND sidecars are useful for medium in-memory segments, but
+  massive learned-sparse search should converge toward postings-like disk blocks
+  for sparse dimensions. Keep the WAND semantics and learned-sparse adapters; do
+  not assume a full `SporseIndex` per segment can stay memory resident.
+- `vicinity`: per-segment HNSW sidecars help restart, but massive vector search
+  needs an ANN-specific disk layout: hot routing/entry structures, cold vector or
+  graph pages, and a cache/prefetch policy. SPANN-style hot centroids plus cold
+  posting lists is a plausible separate path from pure HNSW.
+- `precinct`: inherits the vector problem and adds region geometry. Its raw
+  segment metadata needs region family, dimension, metric/lift parameters, and
+  which sub-indexes are hot versus paged.
+- `sketchir` and `gramdex`: MinHash/LSH-style workloads can often keep signatures
+  or bucket directories hot while storing bucket payloads cold. Segment metadata
+  should expose hash family, banding, seed/config, and bucket offsets. Do not
+  load every bucket payload to answer a narrow query.
+- `tranz`, `subsume`, `flowmatch`, `hopfield`, and `symproj`: these are usually
+  artifact/generation-store consumers, not `segstore` consumers. Their large
+  outputs are model checkpoints, codebooks, datasets, metrics, and generated
+  samples that need digest, provenance, and generation manifests more than
+  tombstone compaction.
+
 ## Tradeoffs
 
 This keeps the existing API honest: users with in-memory segments keep the small
@@ -188,8 +277,9 @@ depends on them.
 
 1. Add `SegmentCatalog<Id>` over the existing manifest format. Tests should prove
    it opens a manifest without reading or decoding any `segstore.seg.<id>` file.
-2. Add a low-level mapped/checkpoint-payload helper only if a consumer can use it
-   without full decode. Do not expose it as a general search reader.
+2. Add an explicit I/O capability layer on paper before code: whole-file,
+   filesystem path/mmap, range, vectored range, conditional publish. Keep
+   `MemoryDirectory` as a correctness backend, not a performance proxy.
 3. Design the raw-segment manifest extension: segment id plus `SegmentMeta`, with
    compatibility rejection for old manifests that lack metadata.
 4. Implement one consumer first, most likely `postings`, because block metadata,
@@ -213,6 +303,12 @@ depends on them.
   around create/update/range/vectored reads. Do not add it speculatively.
 - If a consumer creates a non-rebuildable derived index, route it to the
   generation/artifact-store design instead of segstore sidecars.
+- If a proposed optimization only improves `MemoryDirectory` benchmarks, do not
+  treat it as evidence for filesystem or object-store behavior.
+- If a proposed backend feature claims performance or crash semantics, its test
+  or benchmark must name the backend class it proves.
+- If a consumer's sidecars must all be loaded to search, cap the claim at
+  restart-time persistence. It is not yet an out-of-core search path.
 
 ## Open Questions
 
@@ -225,3 +321,6 @@ depends on them.
   can the first consumer use force-merge/build-time generation only?
 - Which consumer should be the first implementation gate: `postings` for exact
   lexical/sparse evidence, or `vicinity` for ANN restart and disk-graph pressure?
+- Should backend capability traits live in `durability` because they are I/O
+  primitives, or in `segstore` because pinning/GC visibility is segment-lifecycle
+  state?

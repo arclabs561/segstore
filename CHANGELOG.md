@@ -16,6 +16,10 @@ unstable: minor bumps may break the public API and the on-disk format.
   per file, but `SegmentedStore::open` still loads manifest segments into
   `Arc<Segment>` memory. Larger-than-memory readers need a future file/mmap-backed
   segment-reader API rather than the current in-memory `View::segments` model.
+- Refined the out-of-core reader design around backend capabilities (memory,
+  local filesystem/mmap, range/vectored reads, and object-store publish) and
+  mapped the raw-segment path across postings, lexir, sporse, vicinity, precinct,
+  sketchir, gramdex, and artifact/generation-store consumers.
 
 ### Added
 

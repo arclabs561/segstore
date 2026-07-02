@@ -98,6 +98,16 @@
 //! checkpoint blob with the manifest + per-segment-file layout above. A 0.1
 //! unsuffixed `segstore.wal` and a 0.2 `segstore.ckpt` (with no manifest) are each
 //! detected and rejected with a clear error rather than misread.
+//!
+//! # Memory model
+//!
+//! The on-disk layout is segment-per-file, but the current read API is still an
+//! in-memory segment model: [`SegmentedStore::open`] deserializes every manifest
+//! segment into `Arc<Store::Segment>`, and [`View::segments`] exposes those loaded
+//! segments. This is not yet an out-of-core reader for corpora larger than RAM.
+//! Such consumers need a future reader shape that exposes stable segment ids and
+//! segment file handles (or mmap-backed consumer readers) while preserving the
+//! same manifest, checkpoint, and garbage-collection invariants.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;

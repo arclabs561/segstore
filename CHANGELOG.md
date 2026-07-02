@@ -7,6 +7,13 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Changed
+
+- Documented the current memory boundary: segstore persists immutable segments
+  per file, but `SegmentedStore::open` still loads manifest segments into
+  `Arc<Segment>` memory. Larger-than-memory readers need a future file/mmap-backed
+  segment-reader API rather than the current in-memory `View::segments` model.
+
 ### Added
 
 - Module-level `try_index_name(id, kind)` and `index_name(id, kind)` helpers so

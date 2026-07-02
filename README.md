@@ -57,6 +57,22 @@ only the current epoch's WAL. `SyncPolicy::Fsync` (via `open_with_options`) sync
 every WAL record to stable storage; the default flushes to the OS without a
 per-op fsync.
 
+## Memory model
+
+The on-disk layout is segment-per-file, but the current `SegmentedStore::open`
+API loads every manifest segment into `Arc<Segment>` memory and `View::segments`
+returns those in-memory segments. That is the right shape for fast embedded
+indexes whose active segment set fits RAM, and for caching expensive per-segment
+sidecars across restarts.
+
+For corpora larger than memory, segstore is not yet a complete out-of-core
+reader. The next layer needs a reader/open path that can expose stable segment
+ids and segment file handles (or mmap-backed consumer readers) without
+deserializing each payload. `durability` already provides filesystem paths and an
+optional mmap helper; the missing piece is a segstore API that keeps the
+manifest/GC/checkpoint guarantees while letting consumers stream or map their own
+segment formats.
+
 ## Compaction
 
 `compact()` merges all segments into one and purges tombstones.

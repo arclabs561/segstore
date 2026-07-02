@@ -9,6 +9,9 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Changed
 
+- Batched best-effort GC of stale WAL, segment, and index-sidecar files so
+  filesystem-backed cleanup syncs the parent directory once per batch instead of
+  leaving deletion durability to a later operation.
 - Documented the current memory boundary: segstore persists immutable segments
   per file, but `SegmentedStore::open` still loads manifest segments into
   `Arc<Segment>` memory. Larger-than-memory readers need a future file/mmap-backed
@@ -16,6 +19,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Added
 
+- Filesystem sidecar-GC compaction benchmark to track the real directory-sync
+  cost of deleting stale segment and index files after checkpoint commits.
 - `SegmentCatalog<Id>` for reading the checkpoint manifest without decoding
   segment payload files. It exposes stable segment ids, tombstone checks, segment
   file names/paths, and sidecar names for diagnostic and restart-time loader

@@ -211,6 +211,18 @@ fn index_sidecar_name(id: u64, kind: &str) -> PersistenceResult<String> {
     Ok(format!("{IDX_PREFIX}{id}.{kind}"))
 }
 
+fn delete_files_best_effort(dir: &dyn Directory, names: Vec<String>, durable: bool) {
+    let mut deleted = false;
+    for name in names {
+        if dir.exists(&name) && dir.delete(&name).is_ok() {
+            deleted = true;
+        }
+    }
+    if durable && deleted {
+        let _ = dir.durable_sync_parent_dir(MANIFEST_PATH);
+    }
+}
+
 /// The reserved sidecar file name for a consumer's per-segment built index.
 ///
 /// Use this with [`View::segment_ids`] when a reader/searcher needs to load a
@@ -708,6 +720,7 @@ impl<S: Store> SegmentedStore<S> {
             }
         }
         let persisted_ids: HashSet<u64> = segment_ids.iter().copied().collect();
+        let durable = dir.file_path(MANIFEST_PATH).is_some();
 
         // Replay the current epoch's WAL in full. It holds exactly the ops since
         // the checkpoint, so every record is applied (no skip offset).
@@ -727,28 +740,30 @@ impl<S: Store> SegmentedStore<S> {
         // orphan segment files (any `segstore.seg.<k>` the manifest does not name,
         // left by a crash between a segment write and the manifest write).
         if let Ok(names) = dir.list_dir("") {
+            let mut garbage = Vec::new();
             for name in names {
                 if let Some(k) = name
                     .strip_prefix(WAL_PREFIX)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     if k != epoch {
-                        let _ = dir.delete(&name);
+                        garbage.push(name);
                     }
                 } else if let Some(k) = name
                     .strip_prefix(SEG_PREFIX)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     if !persisted_ids.contains(&k) {
-                        let _ = dir.delete(&name);
+                        garbage.push(name);
                     }
                 } else if let Some(k) = idx_seg_id(&name) {
                     // Consumer index sidecar whose segment is gone: orphan, GC it.
                     if !persisted_ids.contains(&k) {
-                        let _ = dir.delete(&name);
+                        garbage.push(name);
                     }
                 }
             }
+            delete_files_best_effort(&*dir, garbage, durable);
         }
 
         let wal = RecordLogWriter::new(dir.clone(), live_wal);
@@ -886,7 +901,7 @@ impl<S: Store> SegmentedStore<S> {
     /// Delete every `segstore.seg.<k>` file whose id is not in `keep`, and forget
     /// those ids from `persisted_ids`. Called only after a manifest is durable, so
     /// a crash mid-GC just leaves orphans that the next open re-GCs.
-    fn gc_orphan_segments(&mut self, keep: &HashSet<u64>) {
+    fn gc_orphan_segments(&mut self, keep: &HashSet<u64>, durable: bool, mut garbage: Vec<String>) {
         self.persisted_ids.retain(|id| keep.contains(id));
         if let Ok(names) = self.dir.list_dir("") {
             for name in names {
@@ -895,16 +910,17 @@ impl<S: Store> SegmentedStore<S> {
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     if !keep.contains(&k) {
-                        let _ = self.dir.delete(&name);
+                        garbage.push(name);
                     }
                 } else if let Some(k) = idx_seg_id(&name) {
                     // A consumer's index sidecar for a compacted-away segment.
                     if !keep.contains(&k) {
-                        let _ = self.dir.delete(&name);
+                        garbage.push(name);
                     }
                 }
             }
         }
+        delete_files_best_effort(&*self.dir, garbage, durable);
     }
 
     /// Merge ALL segments into one, dropping tombstoned ids and purging the
@@ -1280,12 +1296,11 @@ impl<S: Store> SegmentedStore<S> {
         let old_epoch = self.epoch;
         self.wal = RecordLogWriter::new(self.dir.clone(), wal_path(new_epoch));
         self.epoch = new_epoch;
-        let _ = self.dir.delete(&wal_path(old_epoch));
 
         // 4. GC the segment files the new manifest no longer names (a merge's
         //    inputs). Safe only now that the manifest is durable.
         let keep: HashSet<u64> = self.segment_ids.iter().copied().collect();
-        self.gc_orphan_segments(&keep);
+        self.gc_orphan_segments(&keep, durable, vec![wal_path(old_epoch)]);
 
         // 5. Publish the post-checkpoint segment set to readers (the commit point).
         self.republish();
@@ -2174,6 +2189,82 @@ mod tests {
             seg_file_count(&dir),
             1,
             "the merged-away segment files are GC'd; only the result remains"
+        );
+    }
+
+    #[test]
+    fn best_effort_delete_batch_syncs_parent_once() {
+        struct SyncCountDir {
+            inner: Arc<dyn Directory>,
+            syncs: std::sync::atomic::AtomicUsize,
+        }
+        impl Directory for SyncCountDir {
+            fn create_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+                self.inner.create_file(p)
+            }
+            fn open_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
+                self.inner.open_file(p)
+            }
+            fn exists(&self, p: &str) -> bool {
+                self.inner.exists(p)
+            }
+            fn delete(&self, p: &str) -> PersistenceResult<()> {
+                self.inner.delete(p)
+            }
+            fn atomic_rename(&self, a: &str, b: &str) -> PersistenceResult<()> {
+                self.inner.atomic_rename(a, b)
+            }
+            fn create_dir_all(&self, p: &str) -> PersistenceResult<()> {
+                self.inner.create_dir_all(p)
+            }
+            fn list_dir(&self, p: &str) -> PersistenceResult<Vec<String>> {
+                self.inner.list_dir(p)
+            }
+            fn append_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+                self.inner.append_file(p)
+            }
+            fn atomic_write(&self, p: &str, d: &[u8]) -> PersistenceResult<()> {
+                self.inner.atomic_write(p, d)
+            }
+            fn file_path(&self, p: &str) -> Option<std::path::PathBuf> {
+                Some(std::path::PathBuf::from("/tmp/segstore-sync-count").join(p))
+            }
+            fn durable_sync_parent_dir(&self, _path: &str) -> PersistenceResult<()> {
+                self.syncs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let dir = SyncCountDir {
+            inner: MemoryDirectory::arc(),
+            syncs: std::sync::atomic::AtomicUsize::new(0),
+        };
+        dir.atomic_write("a", b"a").unwrap();
+        dir.atomic_write("b", b"b").unwrap();
+
+        delete_files_best_effort(&dir, vec!["a".into(), "b".into(), "missing".into()], true);
+        assert!(!dir.exists("a"));
+        assert!(!dir.exists("b"));
+        assert_eq!(
+            dir.syncs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "multiple GC deletes share one parent-directory sync"
+        );
+
+        delete_files_best_effort(&dir, vec!["missing".into()], true);
+        assert_eq!(
+            dir.syncs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "missing files do not force a parent-directory sync"
+        );
+
+        dir.atomic_write("c", b"c").unwrap();
+        delete_files_best_effort(&dir, vec!["c".into()], false);
+        assert_eq!(
+            dir.syncs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "non-durable cleanup does not sync"
         );
     }
 

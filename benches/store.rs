@@ -334,6 +334,53 @@ fn bench_sidecar_gc_on_compact(c: &mut Criterion) {
     g.finish();
 }
 
+/// Same sidecar-GC shape on a real filesystem. The in-memory bench above
+/// isolates orchestration cost; this one tracks the directory-sync cost of
+/// deleting stale segment/index files after the manifest commit.
+fn bench_sidecar_gc_on_compact_fs(c: &mut Criterion) {
+    use durability::FsDirectory;
+    let mut g = c.benchmark_group("sidecar_gc_compact_fs_512");
+    let mk = |tag: &str| {
+        let mut p = std::env::temp_dir();
+        p.push(format!("segbench-sidecar-gc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    };
+    for sidecars in [false, true] {
+        let label = if sidecars {
+            "with_sidecars"
+        } else {
+            "without_sidecars"
+        };
+        g.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let p = mk(label);
+                    let dir = FsDirectory::arc(&p).unwrap();
+                    let mut s =
+                        SegmentedStore::open_with_options(dir.clone(), Kv, Options::new(64))
+                            .unwrap();
+                    fill(&mut s, 512);
+                    s.checkpoint().unwrap();
+                    if sidecars {
+                        for &id in s.segment_ids() {
+                            dir.atomic_write(&s.index_name(id, "bench"), b"built-index")
+                                .unwrap();
+                        }
+                    }
+                    (p, s)
+                },
+                |(p, mut s)| {
+                    s.compact().unwrap();
+                    let _ = std::fs::remove_dir_all(&p);
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    g.finish();
+}
+
 /// Recovery (reopen) cost on the 512-byte payload, the dimension where zero-copy
 /// would matter: `open` postcard-DECODES every segment file (O(total payload)),
 /// while queries are in-memory and never decode. Contrast the toy `recover` group
@@ -405,6 +452,7 @@ criterion_group!(
     bench_compact_realistic,
     bench_sync_policy,
     bench_sidecar_gc_on_compact,
+    bench_sidecar_gc_on_compact_fs,
     bench_recovery_blob,
     bench_segment_catalog_open
 );

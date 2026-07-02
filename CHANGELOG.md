@@ -23,6 +23,10 @@ unstable: minor bumps may break the public API and the on-disk format.
 - Added an I/O-classification matrix to the out-of-core reader design, tying
   memory, local SSD, slow/network filesystem, object-store/range, and tiered
   search backends to their expected access patterns and evidence gates.
+- Extended the out-of-core design with operation classes and store-family
+  boundaries, separating local durability, segment lifecycle, raw segment
+  readers, materialized logs, generation/artifact snapshots, and rebuildable
+  caches.
 
 ### Added
 

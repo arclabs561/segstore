@@ -77,6 +77,20 @@ access pattern is cheap enough to design around:
 | Object store / HTTP range backend | Immutable blobs, multipart writes, conditional publish, coarse range/vectored reads | Seek-like small random reads, directory semantics, rename/fsync assumptions | Coalesced range planning, local cache, generation manifests, conditional publication | Range/vectored benchmarks; publish-race tests |
 | Tiered vector/search system | Hot routers/centroids/dictionaries in RAM or SSD cache; cold vectors/postings in large blocks | Fetch-to-discard reranking, graph traversal that reads full vectors too early | Consumer-owned layout: SPANN-style hot centroids plus cold lists, graph topology separated from heavy vectors, postings block summaries | Recall/latency/memory benchmarks with a named tier mix |
 
+The same backend can support several operation classes. Design and benchmark the
+operation class, not just the device name:
+
+| Operation class | Cheap assumption | Bad assumption | Segstore implication |
+| --- | --- | --- | --- |
+| Hot metadata | Random access to small dictionaries, routers, centroids, block summaries, top graph layers | Keeping payload blocks, vectors, or full posting lists hot forever | Manifest metadata and consumer sidecars may stay in memory; raw payloads should not have to |
+| WAL append | Sequential append plus occasional sync | Treating every item update as a separate durable random write | `durability` is the right floor for committed mutations; query readers should not depend on WAL replay |
+| Immutable segment scan | Large sequential read/write during build or compaction | Point queries that decode whole segments | `segstore` should own lifecycle and compaction scheduling, while consumers own scan/merge readers |
+| Page-backed local reads | Bounded random page faults, mmap, page-cache reuse, advisory access hints | Unbounded pointer chasing over cold pages | Filesystem raw readers need pinning, page-sized records, and backend-named benchmarks |
+| Explicit range reads | Batched `pread`/range requests and coalesced spans | One remote or sys-call range per posting, neighbor, or vector | A future range API should return planned spans or vectored results, not a seek-like cursor |
+| Object-store publication | Immutable blobs, multipart writes, conditional publish, snapshot/generation pointers | Atomic rename, parent-dir fsync, cheap directory listing, low-latency tiny reads | This is closer to generation/artifact snapshots than local `SegmentedStore` mutation |
+| GPU/HBM scan | Batched, coalesced, fixed-width memory access | Branch-heavy WAND pivots, varint decode chains, per-query CPU-style traversal | `postings` and `sporse` formats need room for GPU-oriented layouts distinct from CPU compressed blocks |
+| Far-memory refinement | Compact codes or residuals streamed from a middle tier | Fetching full precision vectors from SSD for every rerank candidate | `vicinity`/`precinct` should separate routing, compressed scoring data, and full vectors |
+
 External evidence points the same way:
 
 - Tantivy searchers hold snapshots of immutable segment readers, and its on-disk
@@ -87,15 +101,46 @@ External evidence points the same way:
   range reads, and vectored reads. Those are backend-access primitives, not a
   search-index data model:
   <https://docs.rs/object_store>.
+- Amazon S3's own performance guidance recommends concurrent range requests;
+  the 2026 whitepaper gives 8 MB or 16 MB as typical byte-range sizes. That is
+  the opposite of a seekable-file mental model:
+  <https://docs.aws.amazon.com/pdfs/whitepapers/latest/s3-optimizing-performance-best-practices/s3-optimizing-performance-best-practices.pdf>.
 - Apache OpenDAL makes the same capability distinction from another direction:
   its design guidance is to describe service capabilities and use native backend
   features when possible:
   <https://opendal.apache.org/docs/vision/>.
+- Apache Iceberg snapshots define a table's data as the union of files in
+  manifests and reuse manifest files across snapshots. That is useful precedent
+  for generation/artifact stores: publish a new manifest over immutable blobs
+  instead of mutating files in place:
+  <https://iceberg.apache.org/spec/>.
+- RocksDB's core model is memtable, SST file, and log file. That reinforces the
+  split between write absorption, immutable sorted files, and replayable
+  durability:
+  <https://github.com/facebook/rocksdb/wiki/RocksDB-Overview>.
+- `posix_fadvise` distinguishes normal, random, sequential, will-need, and
+  don't-need access expectations. If the kernel API exposes access shape, the
+  store API should not erase it:
+  <https://man7.org/linux/man-pages/man2/posix_fadvise.2.html>.
 - A 2026 vector-search storage survey frames the field as memory-resident,
   static memory-SSD, and elastic memory-SSD-object-store architectures. That is
   a useful mental model for `vicinity` and `precinct`: storage tiering changes
   the ANN algorithm, not just its persistence backend:
   <https://arxiv.org/html/2601.01937v1>.
+- FaTRQ reports that second-pass vector refinement can spend most query time
+  reading vectors from storage, then avoids much of that traffic by streaming
+  compact residual codes from an intermediate memory tier. The lesson for local
+  crates is to design reranking payloads separately from full vector payloads:
+  <https://arxiv.org/html/2601.09985v1>.
+- VeloANN argues that SSD-resident graph ANN needs locality-aware page layout,
+  record-level caching, prefetch, and asynchronous compute/I/O overlap. That is
+  a stronger requirement than simply making HNSW serializable:
+  <https://arxiv.org/html/2602.22805v1>.
+- LSM-VEC combines HNSW-like hierarchy with LSM-style disk maintenance for
+  dynamic vector updates, keeping upper layers hot while maintaining the
+  disk-resident bottom graph through log-structured levels. That makes
+  compaction an algorithm hook, not just storage cleanup:
+  <https://arxiv.org/html/2505.17152v2>.
 - Disk ANN work such as SPANN keeps centroids in memory and large posting lists
   on disk, while DiskANN-family work makes page and graph layout part of the
   algorithm. This argues for consumer-owned bytes and metadata, not a generic
@@ -104,11 +149,35 @@ External evidence points the same way:
   Block-Max pruning, query-term pruning, and high-document-frequency term
   handling. That belongs in `postings`/`sporse` byte layouts, not in `segstore`:
   <https://arxiv.org/html/2405.01117v1>.
+- Newer sparse retrieval work splits by execution engine: CPU systems improve
+  block/superblock pruning, while GPU systems such as GPUSparse use flat,
+  warp-aligned posting lists and batched scatter-add. That argues for explicit
+  format variants rather than one "best" postings layout:
+  <https://arxiv.org/html/2606.26441v1>.
 - RISE shows current Rust inverted-index prior art with compressed postings,
   DAAT, WAND, MaxScore, and Block-Max variants. This raises the bar for
   `postings`: a raw segment format should carry block metadata and compression
   choices explicitly, not through a generic store wrapper:
   <https://arxiv.org/html/2606.07187v1>.
+
+## Store Families
+
+The storage ecosystem should probably have several narrow store families rather
+than one bigger `segstore`:
+
+| Store family | Owns | Does not own | Best consumers |
+| --- | --- | --- | --- |
+| `durability` | Atomic local writes, WAL framing, replay, CRCs, fsync discipline | Search-index layout, segment lifecycle, object-store snapshots | Any crate that commits local state on a filesystem-like backend |
+| `segstore` | Mutable set of immutable local segments, tombstones, compaction, pinned views, sidecar GC | Byte layout for postings, vectors, sketches, or artifacts | `postings`, `sporse`, `gramdex`, `sketchir`, medium local indexes |
+| Raw segment layer | Consumer-owned segment bytes plus manifest metadata and pinned byte/file/range readers | Generic deserialize-to-RAM segments | First `postings`, then ANN and sketch consumers |
+| Materialized log | Replayable operation stream, debugging, maintenance, reproducible rebuilds | Low-latency query serving by itself | `lexir` CLI workflows, batch maintenance, audit trails |
+| Generation/artifact store | Content-addressed blobs, provenance, metrics, snapshots, model/codebook/dataset artifacts, optional object-store publication | Tombstone-heavy mutable search indexes | `tranz`, `subsume`, `flowmatch`, `hopfield`, `symproj`, eval outputs |
+| Rebuildable cache store | Local derived files with digest/config keys and GC | Correctness source of truth | Sidecars, quantizer caches, model-derived acceleration data |
+
+This keeps the zero-dependency bias intact. `durability` remains the small local
+correctness layer. `segstore` stays local and segment-lifecycle focused. Object
+store and GPU/far-memory backends should be optional capability layers or
+separate crates only when a consumer has a benchmark or dataset that needs them.
 
 ## Non-Goals
 

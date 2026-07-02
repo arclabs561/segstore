@@ -66,6 +66,17 @@ That argues for capability-driven APIs, not a single `Directory` performance
 story. `segstore` should keep the local crash-consistency contract small while
 making it possible to add range/vectored/object-store capabilities later.
 
+The useful classification is not just slow versus fast storage. It is which
+access pattern is cheap enough to design around:
+
+| Backend class | Cheap path | Expensive path | Algorithmic response | Evidence required |
+| --- | --- | --- | --- | --- |
+| Memory-only test backend | Whole-object reads, deterministic failure modeling | None of fsync, mmap, page cache, deletion durability, or I/O latency is real | Use for correctness, fuzzing, and crash-model tests only | Unit/property tests; never performance claims |
+| Local SSD/NVMe filesystem | mmap, page-cache reuse, sequential compaction, bounded random reads | Excessive small-file metadata churn, unbounded random page faults, per-record fsync | Page/block layouts, hot dictionaries, advisory access hints, background compaction | Criterion benchmarks on filesystem `Directory`; mmap/page-fault-sensitive tests when relevant |
+| HDD or network filesystem | Large sequential reads and writes | Fine-grained random reads, frequent syncs, metadata round trips | Larger blocks, prefetch, merge scans, fewer files, fewer directory operations | Backend-named benchmarks; no extrapolation from SSD |
+| Object store / HTTP range backend | Immutable blobs, multipart writes, conditional publish, coarse range/vectored reads | Seek-like small random reads, directory semantics, rename/fsync assumptions | Coalesced range planning, local cache, generation manifests, conditional publication | Range/vectored benchmarks; publish-race tests |
+| Tiered vector/search system | Hot routers/centroids/dictionaries in RAM or SSD cache; cold vectors/postings in large blocks | Fetch-to-discard reranking, graph traversal that reads full vectors too early | Consumer-owned layout: SPANN-style hot centroids plus cold lists, graph topology separated from heavy vectors, postings block summaries | Recall/latency/memory benchmarks with a named tier mix |
+
 External evidence points the same way:
 
 - Tantivy searchers hold snapshots of immutable segment readers, and its on-disk
@@ -76,6 +87,15 @@ External evidence points the same way:
   range reads, and vectored reads. Those are backend-access primitives, not a
   search-index data model:
   <https://docs.rs/object_store>.
+- Apache OpenDAL makes the same capability distinction from another direction:
+  its design guidance is to describe service capabilities and use native backend
+  features when possible:
+  <https://opendal.apache.org/docs/vision/>.
+- A 2026 vector-search storage survey frames the field as memory-resident,
+  static memory-SSD, and elastic memory-SSD-object-store architectures. That is
+  a useful mental model for `vicinity` and `precinct`: storage tiering changes
+  the ANN algorithm, not just its persistence backend:
+  <https://arxiv.org/html/2601.01937v1>.
 - Disk ANN work such as SPANN keeps centroids in memory and large posting lists
   on disk, while DiskANN-family work makes page and graph layout part of the
   algorithm. This argues for consumer-owned bytes and metadata, not a generic

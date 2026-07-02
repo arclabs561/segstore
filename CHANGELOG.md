@@ -20,6 +20,9 @@ unstable: minor bumps may break the public API and the on-disk format.
   local filesystem/mmap, range/vectored reads, and object-store publish) and
   mapped the raw-segment path across postings, lexir, sporse, vicinity, precinct,
   sketchir, gramdex, and artifact/generation-store consumers.
+- Added an I/O-classification matrix to the out-of-core reader design, tying
+  memory, local SSD, slow/network filesystem, object-store/range, and tiered
+  search backends to their expected access patterns and evidence gates.
 
 ### Added
 

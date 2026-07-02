@@ -56,9 +56,11 @@ structure or its results:
 Consumers vary enough that centralizing this descriptor in segstore would be the
 wrong layer:
 
-- `sporse`: sparse-vector schema, WAND/posting-list codec version, block-max
-  layout, and nonnegative-weight assumptions. Query-time `k` is not part of the
-  recipe.
+- `sporse`: sparse-vector schema, adapter version into `postings`, learned-sparse
+  weighting assumptions, and any nonnegative-weight contract. Reusable
+  posting-list codec, WAND, MaxScore, block-max, and BMP-style metadata belong
+  in `postings`; a `sporse` sidecar records which `postings` recipe it used.
+  Query-time `k` is not part of the recipe.
 - `sketchir`: `BlockingConfig` (`num_bands`, `num_hashes_per_band`,
   `ngram_size`, `char_ngrams`), shingling/tokenizer version, MinHash hash
   family and seed, and id-map layout.
@@ -90,14 +92,15 @@ The optimization target is different for each consumer. A useful sidecar is not
 "whatever serde can dump"; it is the smallest loadable artifact that preserves
 the expensive build work and can reject stale assumptions before search.
 
-- `sporse` should persist finalized posting lists: sorted doc ids, weights,
-  per-block maxima, list maxima, and enough header data to prove the sparse-vector
-  contract still holds. Recomputing block maxima from postings may be acceptable
-  if it keeps the format smaller, but re-sorting every list on restart gives back
-  the main win. Query-time `k` and any current heap threshold stay outside the
-  sidecar. A later search optimization can share a global top-k threshold across
-  segments to let Block-Max WAND prune harder; that is a query executor concern,
-  not a sidecar-format concern.
+- `postings` should own finalized posting-list structures: sorted doc ids,
+  weights, compressed blocks, per-block maxima, list maxima, and any WAND,
+  MaxScore, or BMP-style metadata. `sporse` can persist or reference those
+  structures for learned sparse vectors, but its recipe descriptor should cover
+  sparse-vector assumptions and the `postings` recipe version rather than fork
+  the posting-list engine. Query-time `k` and any current heap threshold stay
+  outside the sidecar. A later search optimization can share a global top-k
+  threshold across segments to let Block-Max WAND prune harder; that is a query
+  executor concern, not a sidecar-format concern.
 - `sketchir` should persist the MinHash signatures, band buckets, and insertion
   order id map for a segment. The text source remains in the segment. The recipe
   must cover shingling/tokenization and deterministic hash seeds because changing

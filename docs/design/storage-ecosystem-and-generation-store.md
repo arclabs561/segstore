@@ -32,6 +32,14 @@ Existing local decisions matter:
   per-segment sidecar garbage collection.
 - `segstore` sidecars are rebuildable consumer caches keyed by stable segment
   ids. They are not manifest-committed correctness artifacts.
+- `postings` owns the inverted-index engine: sorted posting lists, candidate
+  union/intersection, compressed posting payloads, and any future block-max,
+  WAND, MaxScore, or BMP-style posting-list metadata. `lexir` and `sporse`
+  should consume those mechanics rather than reimplement them.
+- `lexir` owns lexical scoring policy and corpus statistics over `postings`.
+  `sporse` owns learned-sparse vector semantics and may use `postings` when the
+  sparse dimensions are term/posting shaped. `cnk` remains the low-level ID-set
+  compression toolbox.
 - `lexir` already proves a separate materialized-log shape: state checkpoint,
   `applied_records` metadata, operation-log suffix replay, validation, compact,
   prune, and doctor commands.
@@ -84,6 +92,9 @@ format. It points to narrower per-consumer work:
   scatter-add scoring over GPU-resident inverted indexes, causal/LLM sparse
   encoders, Latent Terms, and sparse late interaction all keep the inverted
   index central but change block layout, query processing, and scorer shape.
+  In this workspace, that makes `postings` the first implementation target for
+  posting-list pruning and block metadata. `sporse` should gain the learned
+  sparse adapters and search APIs that use those lower-level structures.
   A later pass sharpened this: SPLADE is now a baseline family, not the frontier.
   DF-FLOPS attacks high document-frequency terms, Two-Step SPLADE and
   billion-scale SPLADE work use pruned first-stage vectors plus top-k query-term

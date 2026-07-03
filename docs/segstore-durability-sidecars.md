@@ -234,10 +234,10 @@ standardize storage mechanics. `tranz` needs a file-artifact manifest;
 rebuildable caches; `lexir` needs a materialized operation log.
 
 Use current crate names when describing these relationships. `vicinity` is the
-ANN/HNSW crate formerly referred to as `jin`. `tranz` is the point-embedding KGE
-crate for TransE/RotatE/ComplEx/DistMult. `sheaf` is still the current facade for
-the cluster, Leiden, distribution-distance, and kNN graph evaluation APIs used
-by `flowmatch`.
+ANN/HNSW crate. `tranz` is the point-embedding KGE crate for
+TransE/RotatE/ComplEx/DistMult. `sheaf` is still the current facade for the
+cluster, Leiden, distribution-distance, and kNN graph evaluation APIs used by
+`flowmatch`.
 
 ## Segstore Feature Use
 

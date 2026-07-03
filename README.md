@@ -1,7 +1,6 @@
 # segstore
 
-Generic durable segmented store: write-ahead log, immutable segments, tombstone
-deletes, checkpoint, and compaction.
+Generic durable segmented store with write-ahead log and compaction.
 
 A consumer implements the `Store` trait to say how a batch of items becomes a
 segment and how segments merge during compaction; segstore owns the durability
@@ -9,6 +8,13 @@ segment and how segments merge during compaction; segstore owns the durability
 lifecycle. The segment representation is opaque, so the same machinery backs an
 inverted index (posting-list segments), a graph index (graph-delta segments), or
 any other updatable structure.
+
+## Install
+
+```toml
+[dependencies]
+segstore = "0.4"
+```
 
 ## Example
 

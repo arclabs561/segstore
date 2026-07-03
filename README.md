@@ -78,6 +78,12 @@ payload files, read one segment's validated serialized payload bytes, or decode
 one requested segment for sidecar rebuilds. It is still a catalog helper for
 loaders and diagnostics, not a byte-native query reader.
 
+For byte-native query paths, use consumer sidecars. `segstore` reserves and
+garbage-collects `segstore.idx.<segment-id>.<kind>` next to the source segment,
+but the consumer owns the sidecar format and compatibility checks. A postings
+crate can store a raw postings block there; an ANN crate can store graph pages
+there. `segstore.seg.<id>` remains the durable source payload.
+
 ## Compaction
 
 `compact()` merges all segments into one and purges tombstones.

@@ -9,6 +9,12 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Changed
 
+- `read_segment_payload` no longer allocates the header's claimed payload
+  length up front: a corrupt length prefix under the 256 MiB cap previously
+  forced a zeroed allocation up to the cap before the read failed; the buffer
+  now grows with the bytes actually present and a short read fails as a
+  truncation error. `read_segment_payload` and `read_segment` docs now state
+  that tombstones are not applied (filter with `is_live`).
 - A segment or manifest that serializes past the 256 MiB per-blob checkpoint
   cap now fails the checkpoint write with an actionable error naming the
   artifact and the levers (`TierConfig::max_merged_len`, the `open()` flush

@@ -280,8 +280,17 @@ fn read_checkpoint_payload(dir: &dyn Directory, path: &str) -> PersistenceResult
 
     f.read_exact(&mut buf4)?;
     let expected = u32::from_le_bytes(buf4);
-    let mut payload = vec![0u8; len];
-    f.read_exact(&mut payload)?;
+    // Don't trust `len` for the upfront allocation: a corrupt length prefix
+    // under the cap would otherwise force a zeroed allocation up to 256 MiB
+    // before the read fails. Grow with the bytes actually present instead
+    // (mirrors durability's read_exact_bounded).
+    let mut payload = Vec::with_capacity(len.min(1 << 20));
+    let n = std::io::Read::take(&mut *f, len as u64).read_to_end(&mut payload)?;
+    if n < len {
+        return Err(PersistenceError::Format(format!(
+            "checkpoint payload truncated: got {n} of {len} bytes"
+        )));
+    }
     let actual = crc32fast::hash(&payload);
     if actual != expected {
         return Err(PersistenceError::CrcMismatch { expected, actual });
@@ -606,7 +615,9 @@ where
     /// This avoids opening a full [`SegmentedStore`] and avoids deserializing
     /// `Store::Segment`, but it is still a whole-payload read of the postcard
     /// bytes that segstore wrote for that segment. It is a loader/build helper,
-    /// not a streaming or mmap-backed query reader.
+    /// not a streaming or mmap-backed query reader. Tombstones are NOT applied:
+    /// the payload is the segment as written, including records later deleted;
+    /// filter with [`Self::is_live`] before treating contents as live data.
     pub fn read_segment_payload(&self, id: u64) -> PersistenceResult<Vec<u8>> {
         read_checkpoint_payload(&*self.dir, &self.segment_name(id)?)
     }
@@ -616,7 +627,9 @@ where
     /// This is a bounded restart/build helper: it decodes only the requested
     /// segment file instead of opening a full [`SegmentedStore`] and decoding
     /// every segment in the manifest. It is still a whole-segment postcard decode,
-    /// not a byte-native or mmap-backed query reader.
+    /// not a byte-native or mmap-backed query reader. Tombstones are NOT applied:
+    /// the decoded segment is as written, including records later deleted;
+    /// filter with [`Self::is_live`] before treating contents as live data.
     pub fn read_segment<Segment>(&self, id: u64) -> PersistenceResult<Segment>
     where
         Segment: DeserializeOwned,
@@ -1535,6 +1548,37 @@ mod tests {
         )
         .to_string();
         assert_eq!(after, before, "non-cap errors are unchanged");
+    }
+
+    #[test]
+    fn catalog_payload_reader_rejects_truncated_length_claim() {
+        use std::io::Read;
+
+        let dir = MemoryDirectory::arc();
+        let seg_id = {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 1).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.checkpoint().unwrap();
+            s.segment_ids()[0]
+        };
+
+        let name = seg_path(seg_id);
+        let mut file = dir.open_file(&name).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        // Checkpoint envelope layout: magic(4), version(4), last_applied_id(8),
+        // payload_len(8), crc32(4), then payload bytes.
+        let len_offset = 4 + 4 + 8;
+        let claimed = 4_u64 * 1024 * 1024;
+        bytes[len_offset..len_offset + 8].copy_from_slice(&claimed.to_le_bytes());
+        dir.atomic_write(&name, &bytes).unwrap();
+
+        let catalog = SegmentCatalog::<u32>::open(dir).unwrap();
+        let err = catalog.read_segment_payload(seg_id).unwrap_err().to_string();
+        assert!(
+            err.contains("truncated") || err.to_lowercase().contains("eof"),
+            "expected truncation error, got: {err}"
+        );
     }
 
     struct Kv;

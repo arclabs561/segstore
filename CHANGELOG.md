@@ -9,6 +9,13 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Changed
 
+- A segment or manifest that serializes past the 256 MiB per-blob checkpoint
+  cap now fails the checkpoint write with an actionable error naming the
+  artifact and the levers (`TierConfig::max_merged_len`, the `open()` flush
+  threshold, `compact()` to drop tombstones) instead of durability's opaque
+  "checkpoint payload too large". `TierConfig::max_merged_len` docs now note it
+  counts items while the blob cap counts bytes, and that there is no byte-aware
+  merge planning yet. This does not raise the cap or change behavior on success.
 - `SegmentCatalog` now validates segment ids with binary search instead of a
   linear scan. In the many-segment catalog benchmark, naming every segment moved
   from `[979.29 us 983.18 us 988.99 us]` to

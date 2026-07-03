@@ -147,6 +147,29 @@ fn seg_path(id: u64) -> String {
     format!("{SEG_PREFIX}{id}")
 }
 
+/// Each segment (and the manifest) is written as one checkpoint blob, so it is
+/// bounded by [`MAX_CHECKPOINT_PAYLOAD_BYTES`] (256 MiB). That byte cap and the
+/// item-count cap [`TierConfig::max_merged_len`] are in different units and do
+/// not know about each other, so a compaction can target an item count whose
+/// serialized bytes exceed the blob cap and fail here. This rewraps
+/// durability's generic "payload too large" into an actionable message naming
+/// the artifact and the levers; unrelated errors pass through unchanged.
+fn size_cap_context(e: PersistenceError, what: &str) -> PersistenceError {
+    match &e {
+        PersistenceError::Format(msg) if msg.contains("payload too large") => {
+            PersistenceError::Format(format!(
+                "{what} does not fit the {MAX_CHECKPOINT_PAYLOAD_BYTES}-byte per-blob limit \
+                 (durability::MAX_CHECKPOINT_PAYLOAD_BYTES): {msg}. Each segment and the \
+                 manifest are written as a single checkpoint blob. Keep them under the cap: \
+                 lower TierConfig::max_merged_len (it counts items, not bytes) or the open() \
+                 flush_threshold so segments stay smaller, and run compact() to drop \
+                 tombstones from the manifest."
+            ))
+        }
+        _ => e,
+    }
+}
+
 fn reject_legacy_formats(dir: &dyn Directory) -> PersistenceResult<()> {
     // A 0.1 store wrote a single unsuffixed WAL; later formats are epoch-suffixed.
     // Reject it explicitly rather than misread its ops as an epoch.
@@ -322,6 +345,12 @@ pub struct TierConfig {
     /// out of tier merges (Lucene's rule), so the largest segment is never rewritten by
     /// tiering, only by a full [`SegmentedStore::compact`]. Without this, top-tier merges
     /// rewrite the whole dataset (O(N^2) write amplification).
+    ///
+    /// This is an item count, but each segment is persisted as one checkpoint blob
+    /// bounded by [`MAX_CHECKPOINT_PAYLOAD_BYTES`] (256 MiB). The two caps are in
+    /// different units: keep `max_merged_len * (your serialized bytes per item)` under
+    /// that byte cap, or a large merge will fail the checkpoint write. There is no
+    /// byte-aware merge planning yet (see the size-cap discussion in the crate docs).
     pub max_merged_len: usize,
 }
 
@@ -1339,11 +1368,12 @@ impl<S: Store> SegmentedStore<S> {
             .collect();
         for (idx, id) in to_write {
             let seg = &*self.segments[idx];
-            if durable {
-                ckpt.write_postcard_durable(&seg_path(id), 0, seg)?;
+            let seg_write = if durable {
+                ckpt.write_postcard_durable(&seg_path(id), 0, seg)
             } else {
-                ckpt.write_postcard(&seg_path(id), 0, seg)?;
-            }
+                ckpt.write_postcard(&seg_path(id), 0, seg)
+            };
+            seg_write.map_err(|e| size_cap_context(e, &format!("segment {id}")))?;
             self.persisted_ids.insert(id);
         }
 
@@ -1356,11 +1386,12 @@ impl<S: Store> SegmentedStore<S> {
             segment_ids: &self.segment_ids,
             tombstones: &tomb_refs,
         };
-        if durable {
-            ckpt.write_postcard_durable(MANIFEST_PATH, new_epoch, &manifest)?;
+        let manifest_write = if durable {
+            ckpt.write_postcard_durable(MANIFEST_PATH, new_epoch, &manifest)
         } else {
-            ckpt.write_postcard(MANIFEST_PATH, new_epoch, &manifest)?;
-        }
+            ckpt.write_postcard(MANIFEST_PATH, new_epoch, &manifest)
+        };
+        manifest_write.map_err(|e| size_cap_context(e, "manifest (segment ids + tombstones)"))?;
 
         // 3. Past the commit point: start the new WAL generation and drop the old.
         let old_epoch = self.epoch;
@@ -1474,6 +1505,37 @@ fn apply<Id: Clone + Eq + Hash, Item>(
 mod tests {
     use super::*;
     use durability::MemoryDirectory;
+
+    #[test]
+    fn size_cap_context_makes_the_blob_error_actionable() {
+        // The raw durability error is opaque about what overflowed and how to
+        // fix it; the wrapper names the artifact and the levers.
+        let raw = PersistenceError::Format(
+            "checkpoint payload too large: 300000000 bytes (max 268435456)".into(),
+        );
+        let wrapped = size_cap_context(raw, "segment 7");
+        let msg = wrapped.to_string();
+        assert!(msg.contains("segment 7"), "names the artifact: {msg}");
+        assert!(
+            msg.contains("max_merged_len"),
+            "names the item-count lever: {msg}"
+        );
+        assert!(
+            msg.contains("checkpoint payload too large"),
+            "preserves the original detail: {msg}"
+        );
+    }
+
+    #[test]
+    fn size_cap_context_passes_unrelated_errors_through() {
+        let before = PersistenceError::InvalidState("something else".into()).to_string();
+        let after = size_cap_context(
+            PersistenceError::InvalidState("something else".into()),
+            "segment 1",
+        )
+        .to_string();
+        assert_eq!(after, before, "non-cap errors are unchanged");
+    }
 
     struct Kv;
     impl Store for Kv {

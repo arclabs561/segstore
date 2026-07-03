@@ -1574,7 +1574,10 @@ mod tests {
         dir.atomic_write(&name, &bytes).unwrap();
 
         let catalog = SegmentCatalog::<u32>::open(dir).unwrap();
-        let err = catalog.read_segment_payload(seg_id).unwrap_err().to_string();
+        let err = catalog
+            .read_segment_payload(seg_id)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("truncated") || err.to_lowercase().contains("eof"),
             "expected truncation error, got: {err}"

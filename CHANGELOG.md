@@ -48,6 +48,11 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Added
 
+- A boundary-contract test and design note for `SegmentCatalog`: decoded segment
+  payloads are the source bytes as written, while liveness is exposed separately
+  through tombstones. Consumers that query mapped or decoded payloads must apply
+  `is_live` and their own query metadata; segstore remains a segment catalog, not
+  a query reader.
 - Filesystem sidecar-GC compaction benchmark to track the real directory-sync
   cost of deleting stale segment and index files after checkpoint commits.
 - `SegmentPayloadInfo` and `SegmentCatalog::segment_payload_info(id)` for

@@ -36,6 +36,44 @@ Harden the existing contracts before adding broader APIs:
    and algorithm/config assumptions. Missing, corrupt, or mismatched sidecars
    must be rebuilt from the raw segment.
 
+## Boundary Contract and Evidence
+
+The boundary is stricter than "segstore uses segments, consumers use indexes":
+
+- `segstore` publishes durable source segments, stable segment ids, liveness
+  metadata, snapshots, compaction, and garbage collection. It can expose opaque
+  serialized payload bytes or payload offsets for loaders.
+- `segstore` does not interpret query-plannable bytes. It does not apply
+  tombstones inside a decoded payload, choose a postings or graph layout, store
+  recipe fingerprints, score queries, or decide algorithm runtime parameters.
+- `postings::raw` owns the byte layout a lexical or learned-sparse scorer can
+  plan over: term directories, document metadata, block metadata, checksums,
+  range reads, and resident-metadata versus payload accounting.
+- `lexir::raw` owns scoring semantics over those raw files: global BM25 corpus
+  statistics across a segment set, segment ordering, exact top-k merge, and safe
+  segment pruning.
+
+The code now has tests and APIs for this split:
+
+- `SegmentCatalog::open` reads the manifest without decoding segment payloads.
+  Corrupt segment payloads do not prevent catalog inspection, while payload reads
+  still CRC-check and fail.
+- `SegmentCatalog::read_segment` returns the source segment as written. It does
+  not apply tombstones; callers must check `SegmentCatalog::is_live`.
+- `SegmentCatalog::segment_payload_info` exposes payload offset, length, and CRC
+  for mmap/range-read sidecar builders without turning segstore into a query
+  reader.
+- `RawSegmentFile::resident_metadata_len` and
+  `RawSegmentFile::posting_payload_len` expose the postings memory split.
+- `RawSegmentFile::for_each_term_meta` streams term statistics from the directory
+  without reading posting payloads; `lexir::RawBm25CorpusStats` uses that path for
+  all-term corpus statistics.
+
+If a future consumer needs a persisted artifact that is not rebuildable from
+source segments, that is the decision gate for manifest-tracked index
+generations. It is not a reason to put query encodings or algorithm recipes into
+segstore's current sidecar namespace.
+
 ## Per-Consumer Sidecar Recipes
 
 Consumers do not share one validation algorithm. The common invariant is only

@@ -2813,6 +2813,26 @@ mod tests {
     }
 
     #[test]
+    fn segment_catalog_reads_source_payloads_and_exposes_liveness_separately() {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.delete(2).unwrap();
+            s.checkpoint().unwrap();
+        }
+
+        let catalog = SegmentCatalog::<u32>::open(dir).unwrap();
+        let segment_id = catalog.segment_ids()[0];
+        let segment: Vec<(u32, String)> = catalog.read_segment(segment_id).unwrap();
+
+        assert_eq!(segment, vec![(1, "a".into()), (2, "b".into())]);
+        assert!(catalog.is_live(&1));
+        assert!(!catalog.is_live(&2));
+    }
+
+    #[test]
     fn segment_catalog_payload_into_reuses_buffer_and_clears_on_error() {
         use std::io::Read;
 

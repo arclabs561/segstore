@@ -84,6 +84,10 @@ payload files, report a segment payload's file offset/length/CRC, read one
 segment's validated serialized payload bytes into an owned or caller-reused
 buffer, or decode one requested segment for sidecar rebuilds. It is still a
 catalog helper for loaders and diagnostics, not a byte-native query reader.
+The catalog boundary is precise: segment bytes are the source payload as written,
+and tombstones are exposed separately through `is_live`. Consumers that decode or
+map segment bytes must apply liveness and their own query metadata; segstore does
+not convert source payloads into a live query view.
 
 For byte-native query paths, use consumer sidecars. `segstore` reserves and
 garbage-collects `segstore.idx.<segment-id>.<kind>` next to the source segment,

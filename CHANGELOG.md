@@ -7,6 +7,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-04
+
 ### Changed
 
 - `read_segment_payload` no longer allocates the header's claimed payload

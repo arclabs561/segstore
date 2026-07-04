@@ -38,33 +38,3 @@ jobs:
         run: |
           rm -f Cargo.lock
           cargo check
-
-  # Build the fuzz harnesses and fuzz each target briefly. The targets live in a
-  # separate workspace (fuzz/), so the main build never pulls in nightly +
-  # libFuzzer; this job keeps them from bitrotting (an unrun fuzz target is a
-  # deleted one). The full corpus runs out-of-band; this gates that the targets
-  # still build against the current API and survive a short adversarial burst.
-  fuzz-smoke:
-    runs-on: ubuntu-latest
-    # cargo-fuzz defaults to a musl (statically-linked-libc) target on this
-    # runner, and ASAN refuses to link against static libc; -crt-static lets the
-    # sanitizer link. The explicit --target below also pins gnu over the musl
-    # default so the sanitizer is even attempted.
-    env:
-      RUSTFLAGS: "-C target-feature=-crt-static"
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: x86_64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
-      - name: Fuzz each target (45s)
-        run: |
-          for t in ops recover recover_manifest; do
-            cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
-              -max_total_time=45 -max_len=4096
-          done

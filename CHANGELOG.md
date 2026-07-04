@@ -50,6 +50,9 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 - Filesystem sidecar-GC compaction benchmark to track the real directory-sync
   cost of deleting stale segment and index files after checkpoint commits.
+- `SegmentPayloadInfo` and `SegmentCatalog::segment_payload_info(id)` for
+  sidecar loaders that want the serialized payload's file offset, length, and
+  CRC before mapping or range-reading a segment file.
 - `SegmentCatalog<Id>` for reading the checkpoint manifest without decoding
   segment payload files. It exposes stable segment ids, tombstone checks, segment
   file names/paths, and sidecar names for diagnostic and restart-time loader
@@ -59,6 +62,8 @@ unstable: minor bumps may break the public API and the on-disk format.
   need instead of opening the full in-memory store.
 - `SegmentCatalog::read_segment_payload(id)` for reading one segment's
   CRC-validated serialized payload bytes without deserializing `Store::Segment`.
+- `SegmentCatalog::read_segment_payload_into(id, &mut Vec<u8>)` for reusing a
+  caller-owned scratch buffer while scanning many segment payloads.
 - Module-level `try_index_name(id, kind)` and `index_name(id, kind)` helpers so
   reader/searcher code can load sidecars from `View::segment_ids()` without
   holding a writer `SegmentedStore`.

@@ -80,9 +80,10 @@ manifest/GC/checkpoint guarantees while letting consumers stream or map their ow
 segment formats.
 
 `SegmentCatalog` can inspect the checkpoint manifest without opening segment
-payload files, read one segment's validated serialized payload bytes, or decode
-one requested segment for sidecar rebuilds. It is still a catalog helper for
-loaders and diagnostics, not a byte-native query reader.
+payload files, report a segment payload's file offset/length/CRC, read one
+segment's validated serialized payload bytes into an owned or caller-reused
+buffer, or decode one requested segment for sidecar rebuilds. It is still a
+catalog helper for loaders and diagnostics, not a byte-native query reader.
 
 For byte-native query paths, use consumer sidecars. `segstore` reserves and
 garbage-collects `segstore.idx.<segment-id>.<kind>` next to the source segment,

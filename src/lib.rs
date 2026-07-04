@@ -136,6 +136,7 @@ const MANIFEST_PATH: &str = "segstore.manifest";
 const SEG_PREFIX: &str = "segstore.seg.";
 const CHECKPOINT_MAGIC: [u8; 4] = *b"VCKP";
 const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_HEADER_BYTES: u64 = 4 + 4 + 8 + 8 + 4;
 
 /// The WAL file path for a given epoch.
 fn wal_path(epoch: u64) -> String {
@@ -249,8 +250,28 @@ fn delete_files_best_effort(dir: &dyn Directory, names: Vec<String>, durable: bo
     }
 }
 
-fn read_checkpoint_payload(dir: &dyn Directory, path: &str) -> PersistenceResult<Vec<u8>> {
-    let mut f = dir.open_file(path)?;
+/// Location and integrity metadata for the serialized payload inside a segment file.
+///
+/// `segstore.seg.<id>` files are checkpoint envelopes: a fixed header followed by
+/// the serialized `Store::Segment` payload. This metadata lets filesystem-backed
+/// consumers map or range-read only the payload bytes while keeping header parsing
+/// in `segstore`. The CRC is the expected checksum of the payload; callers that
+/// bypass [`SegmentCatalog::read_segment_payload`] or
+/// [`SegmentCatalog::read_segment_payload_into`] must verify it before trusting
+/// bytes from untrusted storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentPayloadInfo {
+    /// Byte offset in the segment file where the serialized payload starts.
+    pub payload_offset: u64,
+    /// Length of the serialized payload in bytes.
+    pub payload_len: usize,
+    /// CRC32 expected for the serialized payload bytes.
+    pub payload_crc32: u32,
+}
+
+fn read_checkpoint_payload_header<R: Read + ?Sized>(
+    f: &mut R,
+) -> PersistenceResult<SegmentPayloadInfo> {
     let mut buf4 = [0u8; 4];
     let mut buf8 = [0u8; 8];
 
@@ -280,21 +301,65 @@ fn read_checkpoint_payload(dir: &dyn Directory, path: &str) -> PersistenceResult
 
     f.read_exact(&mut buf4)?;
     let expected = u32::from_le_bytes(buf4);
+    Ok(SegmentPayloadInfo {
+        payload_offset: CHECKPOINT_HEADER_BYTES,
+        payload_len: len,
+        payload_crc32: expected,
+    })
+}
+
+fn read_checkpoint_payload_info(
+    dir: &dyn Directory,
+    path: &str,
+) -> PersistenceResult<SegmentPayloadInfo> {
+    let mut f = dir.open_file(path)?;
+    read_checkpoint_payload_header(&mut *f)
+}
+
+fn read_checkpoint_payload_into(
+    dir: &dyn Directory,
+    path: &str,
+    payload: &mut Vec<u8>,
+) -> PersistenceResult<()> {
+    let mut f = dir.open_file(path)?;
+    let info = read_checkpoint_payload_header(&mut *f)?;
     // Don't trust `len` for the upfront allocation: a corrupt length prefix
     // under the cap would otherwise force a zeroed allocation up to 256 MiB
     // before the read fails. Grow with the bytes actually present instead
     // (mirrors durability's read_exact_bounded).
-    let mut payload = Vec::with_capacity(len.min(1 << 20));
-    let n = std::io::Read::take(&mut *f, len as u64).read_to_end(&mut payload)?;
-    if n < len {
+    payload.clear();
+    let reserve = info.payload_len.min(1 << 20);
+    if payload.capacity() < reserve {
+        payload.reserve(reserve - payload.capacity());
+    }
+    let n = match std::io::Read::take(&mut *f, info.payload_len as u64).read_to_end(payload) {
+        Ok(n) => n,
+        Err(e) => {
+            payload.clear();
+            return Err(e.into());
+        }
+    };
+    if n < info.payload_len {
+        payload.clear();
         return Err(PersistenceError::Format(format!(
-            "checkpoint payload truncated: got {n} of {len} bytes"
+            "checkpoint payload truncated: got {n} of {} bytes",
+            info.payload_len
         )));
     }
-    let actual = crc32fast::hash(&payload);
-    if actual != expected {
-        return Err(PersistenceError::CrcMismatch { expected, actual });
+    let actual = crc32fast::hash(payload);
+    if actual != info.payload_crc32 {
+        payload.clear();
+        return Err(PersistenceError::CrcMismatch {
+            expected: info.payload_crc32,
+            actual,
+        });
     }
+    Ok(())
+}
+
+fn read_checkpoint_payload(dir: &dyn Directory, path: &str) -> PersistenceResult<Vec<u8>> {
+    let mut payload = Vec::new();
+    read_checkpoint_payload_into(dir, path, &mut payload)?;
     Ok(payload)
 }
 
@@ -610,6 +675,19 @@ where
         self.dir.open_file(&self.segment_name(id)?)
     }
 
+    /// Read one segment file's header and return where its serialized payload lives.
+    ///
+    /// This validates the checkpoint envelope header (magic, version, and payload
+    /// length cap), but it does not read or CRC-check the payload bytes. Use this
+    /// with [`Self::segment_file_path`] for mmap/range-read sidecar rebuilders,
+    /// then verify [`SegmentPayloadInfo::payload_crc32`] over the mapped bytes
+    /// before trusting them. If you want segstore to do the full validation and
+    /// read, use [`Self::read_segment_payload`] or
+    /// [`Self::read_segment_payload_into`].
+    pub fn segment_payload_info(&self, id: u64) -> PersistenceResult<SegmentPayloadInfo> {
+        read_checkpoint_payload_info(&*self.dir, &self.segment_name(id)?)
+    }
+
     /// Read one checkpointed segment's CRC-validated serialized payload bytes.
     ///
     /// This avoids opening a full [`SegmentedStore`] and avoids deserializing
@@ -620,6 +698,20 @@ where
     /// filter with [`Self::is_live`] before treating contents as live data.
     pub fn read_segment_payload(&self, id: u64) -> PersistenceResult<Vec<u8>> {
         read_checkpoint_payload(&*self.dir, &self.segment_name(id)?)
+    }
+
+    /// Read one checkpointed segment's CRC-validated serialized payload bytes into
+    /// `payload`.
+    ///
+    /// This is the reusable-buffer form of [`Self::read_segment_payload`] for
+    /// sidecar builders that scan many segments. `payload` is cleared before the
+    /// read; on error it is left empty.
+    pub fn read_segment_payload_into(
+        &self,
+        id: u64,
+        payload: &mut Vec<u8>,
+    ) -> PersistenceResult<()> {
+        read_checkpoint_payload_into(&*self.dir, &self.segment_name(id)?, payload)
     }
 
     /// Decode one checkpointed segment by id.
@@ -2685,6 +2777,92 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn segment_catalog_payload_info_points_to_validated_payload_bytes() {
+        use std::io::{Read, Seek};
+
+        let root = temp_root("segment-payload-info");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.checkpoint().unwrap();
+        }
+
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let catalog = SegmentCatalog::<u32>::open(dir).unwrap();
+        let seg_id = catalog.segment_ids()[0];
+        let info = catalog.segment_payload_info(seg_id).unwrap();
+        let payload = catalog.read_segment_payload(seg_id).unwrap();
+
+        assert_eq!(info.payload_len, payload.len());
+        assert_eq!(info.payload_crc32, crc32fast::hash(&payload));
+
+        let path = catalog.segment_file_path(seg_id).unwrap().unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
+        file.seek(std::io::SeekFrom::Start(info.payload_offset))
+            .unwrap();
+        let mut from_file = vec![0u8; info.payload_len];
+        file.read_exact(&mut from_file).unwrap();
+        assert_eq!(from_file, payload);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn segment_catalog_payload_into_reuses_buffer_and_clears_on_error() {
+        use std::io::Read;
+
+        let dir = MemoryDirectory::arc();
+        let seg_id = {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 1).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.checkpoint().unwrap();
+            s.segment_ids()[0]
+        };
+        let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+
+        let mut scratch = Vec::with_capacity(1024);
+        let ptr = scratch.as_ptr();
+        catalog
+            .read_segment_payload_into(seg_id, &mut scratch)
+            .unwrap();
+        assert_eq!(
+            scratch.as_ptr(),
+            ptr,
+            "a sufficiently large scratch buffer is reused"
+        );
+        let good_payload = scratch.clone();
+        scratch.extend_from_slice(b"stale suffix");
+        catalog
+            .read_segment_payload_into(seg_id, &mut scratch)
+            .unwrap();
+        assert_eq!(scratch, good_payload, "the destination is cleared first");
+
+        let name = seg_path(seg_id);
+        let mut bytes = Vec::new();
+        dir.open_file(&name)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        dir.atomic_write(&name, &bytes).unwrap();
+
+        let err = catalog
+            .read_segment_payload_into(seg_id, &mut scratch)
+            .unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::CrcMismatch { .. }),
+            "payload corruption is still detected: {err}"
+        );
+        assert!(
+            scratch.is_empty(),
+            "partial/corrupt reads do not leak bytes"
+        );
     }
 
     #[test]

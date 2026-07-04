@@ -269,6 +269,31 @@ pub struct SegmentPayloadInfo {
     pub payload_crc32: u32,
 }
 
+impl SegmentPayloadInfo {
+    /// Verify bytes read from [`Self::payload_offset`] match this payload record.
+    ///
+    /// This is the check mmap and range-read consumers should run before
+    /// trusting bytes obtained without [`SegmentCatalog::read_segment_payload`]
+    /// or [`SegmentCatalog::read_segment_payload_into`].
+    pub fn verify_payload(&self, payload: &[u8]) -> PersistenceResult<()> {
+        if payload.len() != self.payload_len {
+            return Err(PersistenceError::Format(format!(
+                "segment payload length mismatch: got {} bytes, expected {}",
+                payload.len(),
+                self.payload_len
+            )));
+        }
+        let actual = crc32fast::hash(payload);
+        if actual != self.payload_crc32 {
+            return Err(PersistenceError::CrcMismatch {
+                expected: self.payload_crc32,
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
 fn read_checkpoint_payload_header<R: Read + ?Sized>(
     f: &mut R,
 ) -> PersistenceResult<SegmentPayloadInfo> {
@@ -346,13 +371,9 @@ fn read_checkpoint_payload_into(
             info.payload_len
         )));
     }
-    let actual = crc32fast::hash(payload);
-    if actual != info.payload_crc32 {
+    if let Err(err) = info.verify_payload(payload) {
         payload.clear();
-        return Err(PersistenceError::CrcMismatch {
-            expected: info.payload_crc32,
-            actual,
-        });
+        return Err(err);
     }
     Ok(())
 }
@@ -2800,6 +2821,20 @@ mod tests {
 
         assert_eq!(info.payload_len, payload.len());
         assert_eq!(info.payload_crc32, crc32fast::hash(&payload));
+        info.verify_payload(&payload).unwrap();
+
+        let truncated = &payload[..payload.len() - 1];
+        assert!(matches!(
+            info.verify_payload(truncated),
+            Err(PersistenceError::Format(_))
+        ));
+
+        let mut corrupt = payload.clone();
+        corrupt[0] ^= 0xFF;
+        assert!(matches!(
+            info.verify_payload(&corrupt),
+            Err(PersistenceError::CrcMismatch { .. })
+        ));
 
         let path = catalog.segment_file_path(seg_id).unwrap().unwrap();
         let mut file = std::fs::File::open(path).unwrap();

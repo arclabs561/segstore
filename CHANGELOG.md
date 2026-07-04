@@ -48,6 +48,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Added
 
+- `SegmentPayloadInfo::verify_payload` for mmap/range-read consumers that use
+  payload offsets directly and still want segstore's length and CRC check.
 - A boundary-contract test and design note for `SegmentCatalog`: decoded segment
   payloads are the source bytes as written, while liveness is exposed separately
   through tombstones. Consumers that query mapped or decoded payloads must apply

@@ -8,8 +8,9 @@
 //! segstore garbage-collects the sidecar in lockstep with its segment.
 //!
 //! The sidecar here is raw little-endian bytes with a consumer-owned
-//! magic/version/recipe/count header. segstore never reads it; missing or invalid
-//! sidecars are rebuilt from that segment through `SegmentCatalog::read_segment`.
+//! magic/version/segment-id/recipe/count header. segstore never reads it;
+//! missing or invalid sidecars are rebuilt from that segment through
+//! `SegmentCatalog::read_segment`.
 //!
 //! Run: `cargo run --example persist_index`
 
@@ -67,14 +68,16 @@ fn build_index(seg: &[(u32, u64)]) -> Vec<(u64, u32)> {
 /// Persist the built index as raw little-endian bytes.
 ///
 /// The header is deliberately consumer-owned. The recipe identifies the
-/// algorithm/config/input assumptions that make this sidecar valid. segstore only
-/// reserves and GCs the filename namespace.
-fn encode(index: &[(u64, u32)]) -> Vec<u8> {
+/// algorithm/config/input assumptions that make this sidecar valid. The segment
+/// id rejects copied or misnamed sidecars before their payload is trusted.
+/// segstore only reserves and GCs the filename namespace.
+fn encode(seg_id: u64, index: &[(u64, u32)]) -> Vec<u8> {
     let count = u32::try_from(index.len()).expect("demo sidecar count fits in u32");
     let recipe_len = u32::try_from(SIDE_RECIPE.len()).expect("demo recipe fits in u32");
-    let mut bytes = Vec::with_capacity(20 + SIDE_RECIPE.len() + index.len() * 12);
+    let mut bytes = Vec::with_capacity(28 + SIDE_RECIPE.len() + index.len() * 12);
     bytes.extend_from_slice(SIDE_MAGIC);
     bytes.extend_from_slice(&SIDE_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&seg_id.to_le_bytes());
     bytes.extend_from_slice(&recipe_len.to_le_bytes());
     bytes.extend_from_slice(SIDE_RECIPE);
     bytes.extend_from_slice(&count.to_le_bytes());
@@ -85,8 +88,8 @@ fn encode(index: &[(u64, u32)]) -> Vec<u8> {
     bytes
 }
 
-fn decode(bytes: &[u8]) -> Result<Vec<(u64, u32)>, String> {
-    if bytes.len() < 16 {
+fn decode(expected_seg_id: u64, bytes: &[u8]) -> Result<Vec<(u64, u32)>, String> {
+    if bytes.len() < 24 {
         return Err("sidecar header is truncated".into());
     }
     if &bytes[..8] != SIDE_MAGIC {
@@ -96,8 +99,14 @@ fn decode(bytes: &[u8]) -> Result<Vec<(u64, u32)>, String> {
     if version != SIDE_VERSION {
         return Err(format!("unsupported sidecar version {version}"));
     }
-    let recipe_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    let recipe_start = 16usize;
+    let seg_id = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    if seg_id != expected_seg_id {
+        return Err(format!(
+            "sidecar segment id mismatch: got {seg_id}, expected {expected_seg_id}"
+        ));
+    }
+    let recipe_len = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    let recipe_start = 24usize;
     let recipe_end = recipe_start
         .checked_add(recipe_len)
         .ok_or("sidecar recipe length overflow")?;
@@ -145,7 +154,7 @@ fn main() {
         }
         s.checkpoint().unwrap();
         for (idx, &seg_id) in s.segment_ids().iter().enumerate() {
-            let bytes = encode(&build_index(&s.segments()[idx]));
+            let bytes = encode(seg_id, &build_index(&s.segments()[idx]));
             dir.atomic_write(&s.index_name(seg_id, "demo"), &bytes)
                 .unwrap();
         }
@@ -184,7 +193,7 @@ fn main() {
                     Ok(())
                 })
                 .ok()
-                .and_then(|_| decode(&bytes).ok());
+                .and_then(|_| decode(id, &bytes).ok());
             loaded.unwrap_or_else(|| {
                 rebuilt_sidecars += 1;
                 let segment: Vec<(u32, u64)> = catalog.read_segment(id).unwrap();

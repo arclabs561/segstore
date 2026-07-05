@@ -200,9 +200,11 @@ fn reject_legacy_formats(dir: &dyn Directory) -> PersistenceResult<()> {
 /// garbage-collects any file in this namespace whose segment id is not in the
 /// current manifest, on the same crash-safe schedule as the segment files. The
 /// consumer owns the file's encoding and full compatibility checks (segstore
-/// never reads it). `kind` is only a short namespace/coexistence tag; new names
-/// are validated by [`try_index_name`], while GC accepts older non-empty kind
-/// strings so upgrades do not strand legacy sidecars.
+/// never reads it). Those checks should include the expected segment id when a
+/// copied or misnamed sidecar would otherwise be unsafe to accept. `kind` is
+/// only a short namespace/coexistence tag; new names are validated by
+/// [`try_index_name`], while GC accepts older non-empty kind strings so upgrades
+/// do not strand legacy sidecars.
 const IDX_PREFIX: &str = "segstore.idx.";
 
 /// The segment id named by an index sidecar file `segstore.idx.<id>.<kind>`, or
@@ -390,8 +392,9 @@ fn read_checkpoint_payload(dir: &dyn Directory, path: &str) -> PersistenceResult
 /// persisted sidecar without holding the writer's [`SegmentedStore`] handle.
 /// `kind` must be non-empty ASCII alphanumeric plus `_` or `-`. It is a short
 /// namespace tag, not a compatibility proof; put full algorithm/config/input
-/// fingerprints in the sidecar bytes and rebuild from the raw segment when they
-/// mismatch.
+/// fingerprints in the sidecar bytes, include the expected segment id when
+/// accepting a copied sidecar would be unsafe, and rebuild from the raw segment
+/// when they mismatch.
 pub fn try_index_name(id: u64, kind: &str) -> PersistenceResult<String> {
     index_sidecar_name(id, kind)
 }

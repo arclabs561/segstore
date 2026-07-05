@@ -7,6 +7,13 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Changed
+
+- Clarified the sidecar-name contract: `segstore.idx.<id>.<kind>` gives
+  consumers a GC-managed namespace, but the consumer-owned sidecar envelope
+  should validate algorithm/config fingerprints and the expected segment id
+  before trusting a payload.
+
 ## [0.4.1] - 2026-07-04
 
 ### Changed

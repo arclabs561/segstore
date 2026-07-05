@@ -9,6 +9,7 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Changed
 
+- Updated the `postings_sidecar` example to build against `postings` 0.2.13.
 - Clarified the sidecar-name contract: `segstore.idx.<id>.<kind>` gives
   consumers a GC-managed namespace, but the consumer-owned sidecar envelope
   should validate algorithm/config fingerprints and the expected segment id

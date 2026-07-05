@@ -10,6 +10,7 @@ captured from release runs.
 | Back an inverted index with segmented storage | `inverted_index` |
 | Back a vector index with search-all-merge segments | `vector_search` |
 | Persist a built per-segment index sidecar | `persist_index` |
+| Persist byte-native postings sidecars | `postings_sidecar` |
 
 ## Index Shapes
 
@@ -71,3 +72,17 @@ catalog reopen over 10 segments: rebuild-all 164.542µs vs load-all 438.458µs
 The toy build is cheap, so the timing is not a benchmark. The point is the
 sidecar contract: a consumer-owned magic/version/recipe header plus segment-id
 keying lets expensive built indices survive restarts.
+
+### `postings_sidecar`: can a sidecar use a real postings format?
+
+Builds a `postings::raw` segment for each immutable segstore segment and writes
+it under the reserved sidecar name. Reopen goes through `SegmentCatalog`, loads
+the raw sidecars, and filters tombstoned docs with the catalog liveness set.
+
+```bash
+cargo run --release --example postings_sidecar
+```
+
+```text
+  [PASS] segstore segment ids can own postings::raw sidecars across restart
+```

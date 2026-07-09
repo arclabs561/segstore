@@ -7,6 +7,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-09
+
 ### Added
 
 - `DefaultStore<Id, Item>` for the common `Vec<(Id, Item)>` segment shape.

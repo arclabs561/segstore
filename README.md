@@ -13,7 +13,7 @@ any other updatable structure.
 
 ```toml
 [dependencies]
-segstore = "0.4"
+segstore = "0.5"
 ```
 
 ## Example

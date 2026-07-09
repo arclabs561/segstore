@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 segstore = { path = ".." }
-durability = "0.6"
+durability = "0.7.1"
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 

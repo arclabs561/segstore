@@ -70,8 +70,8 @@ catalog reopen over 10 segments: rebuild-all 164.542µs vs load-all 438.458µs
 ```
 
 The toy build is cheap, so the timing is not a benchmark. The point is the
-sidecar contract: a consumer-owned magic/version/recipe header plus segment-id
-keying lets expensive built indices survive restarts.
+sidecar contract: a consumer-owned magic/version/segment-id/recipe/CRC envelope
+lets expensive built indices survive restarts.
 
 ### `postings_sidecar`: can a sidecar use a real postings format?
 

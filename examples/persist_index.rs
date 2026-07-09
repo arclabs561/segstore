@@ -7,10 +7,10 @@
 //! segment id (`segment_ids()`), then on reopen LOAD it instead of rebuilding.
 //! segstore garbage-collects the sidecar in lockstep with its segment.
 //!
-//! The sidecar here is raw little-endian bytes with a consumer-owned
-//! magic/version/segment-id/recipe/count header. segstore never reads it;
-//! missing or invalid sidecars are rebuilt from that segment through
-//! `SegmentCatalog::read_segment`.
+//! The sidecar here uses `SidecarEnvelope` for magic/version/segment-id/recipe/
+//! CRC framing, with raw little-endian bytes as the payload. segstore never
+//! loads sidecars automatically; missing or invalid sidecars are rebuilt from
+//! that segment through `SegmentCatalog::read_segment`.
 //!
 //! Run: `cargo run --example persist_index`
 
@@ -18,7 +18,7 @@ use std::io::Read;
 use std::time::Instant;
 
 use durability::FsDirectory;
-use segstore::{SegmentCatalog, SegmentedStore, Store};
+use segstore::{SegmentCatalog, SegmentedStore, SidecarEnvelope, Store};
 
 const SIDE_MAGIC: &[u8; 8] = b"SIDXDEMO";
 const SIDE_VERSION: u32 = 1;
@@ -73,64 +73,42 @@ fn build_index(seg: &[(u32, u64)]) -> Vec<(u64, u32)> {
 /// segstore only reserves and GCs the filename namespace.
 fn encode(seg_id: u64, index: &[(u64, u32)]) -> Vec<u8> {
     let count = u32::try_from(index.len()).expect("demo sidecar count fits in u32");
-    let recipe_len = u32::try_from(SIDE_RECIPE.len()).expect("demo recipe fits in u32");
-    let mut bytes = Vec::with_capacity(28 + SIDE_RECIPE.len() + index.len() * 12);
-    bytes.extend_from_slice(SIDE_MAGIC);
-    bytes.extend_from_slice(&SIDE_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&seg_id.to_le_bytes());
-    bytes.extend_from_slice(&recipe_len.to_le_bytes());
-    bytes.extend_from_slice(SIDE_RECIPE);
-    bytes.extend_from_slice(&count.to_le_bytes());
+    let mut payload = Vec::with_capacity(4 + index.len() * 12);
+    payload.extend_from_slice(&count.to_le_bytes());
     for &(v, id) in index {
-        bytes.extend_from_slice(&v.to_le_bytes());
-        bytes.extend_from_slice(&id.to_le_bytes());
+        payload.extend_from_slice(&v.to_le_bytes());
+        payload.extend_from_slice(&id.to_le_bytes());
     }
-    bytes
+    SidecarEnvelope::encode(SIDE_MAGIC, SIDE_VERSION, seg_id, SIDE_RECIPE, &payload)
+        .expect("demo sidecar envelope is valid")
 }
 
 fn decode(expected_seg_id: u64, bytes: &[u8]) -> Result<Vec<(u64, u32)>, String> {
-    if bytes.len() < 24 {
-        return Err("sidecar header is truncated".into());
+    let payload = SidecarEnvelope::decode(
+        SIDE_MAGIC,
+        SIDE_VERSION,
+        expected_seg_id,
+        SIDE_RECIPE,
+        bytes,
+    )
+    .map_err(|e| e.to_string())?;
+    if payload.len() < 4 {
+        return Err("sidecar count header is truncated".into());
     }
-    if &bytes[..8] != SIDE_MAGIC {
-        return Err("sidecar magic mismatch".into());
-    }
-    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if version != SIDE_VERSION {
-        return Err(format!("unsupported sidecar version {version}"));
-    }
-    let seg_id = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    if seg_id != expected_seg_id {
-        return Err(format!(
-            "sidecar segment id mismatch: got {seg_id}, expected {expected_seg_id}"
-        ));
-    }
-    let recipe_len = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
-    let recipe_start = 24usize;
-    let recipe_end = recipe_start
-        .checked_add(recipe_len)
-        .ok_or("sidecar recipe length overflow")?;
-    if bytes.len() < recipe_end + 4 {
-        return Err("sidecar recipe/count header is truncated".into());
-    }
-    if &bytes[recipe_start..recipe_end] != SIDE_RECIPE {
-        return Err("sidecar recipe mismatch".into());
-    }
-    let count = u32::from_le_bytes(bytes[recipe_end..recipe_end + 4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
     let payload_bytes = count
         .checked_mul(12)
         .ok_or("sidecar entry count overflow")?;
-    let expected = recipe_end
-        .checked_add(4)
-        .and_then(|n| n.checked_add(payload_bytes))
+    let expected = 4usize
+        .checked_add(payload_bytes)
         .ok_or("sidecar length overflow")?;
-    if bytes.len() != expected {
+    if payload.len() != expected {
         return Err(format!(
             "sidecar length mismatch: got {}, expected {expected}",
-            bytes.len()
+            payload.len()
         ));
     }
-    Ok(bytes[recipe_end + 4..]
+    Ok(payload[4..]
         .chunks_exact(12)
         .map(|c| {
             let v = u64::from_le_bytes(c[..8].try_into().unwrap());

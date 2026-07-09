@@ -7,13 +7,24 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Added
+
+- `DefaultStore<Id, Item>` for the common `Vec<(Id, Item)>` segment shape.
+- `SidecarEnvelope` for the shared magic/version/segment-id/recipe/CRC byte
+  envelope used by consumer sidecars. The payload format and recipe semantics
+  remain consumer-owned.
+
 ### Changed
 
+- Updated `durability` to 0.7.1, picking up bounded length-prefixed reads for
+  checkpoint, record-log, and WAL payloads.
 - Updated the `postings_sidecar` example to build against `postings` 0.2.13.
 - Clarified the sidecar-name contract: `segstore.idx.<id>.<kind>` gives
   consumers a GC-managed namespace, but the consumer-owned sidecar envelope
   should validate algorithm/config fingerprints and the expected segment id
   before trusting a payload.
+- Updated the `persist_index` example to use `SidecarEnvelope` instead of a
+  hand-rolled unchecked sidecar header.
 
 ## [0.4.1] - 2026-07-04
 

@@ -19,35 +19,20 @@ segstore = "0.4"
 ## Example
 
 ```rust
-use segstore::{SegmentedStore, Store};
+use segstore::{DefaultStore, SegmentedStore};
 use durability::MemoryDirectory;
 
-// A segment is just a batch of (id, item) pairs.
-struct Kv;
-impl Store for Kv {
-    type Id = u32;
-    type Item = String;
-    type Segment = Vec<(u32, String)>;
-    fn build_segment(&self, batch: &[(u32, String)]) -> Vec<(u32, String)> {
-        batch.to_vec()
-    }
-    fn merge_segments(
-        &self,
-        segs: &[&Vec<(u32, String)>],
-        live: &dyn Fn(&u32) -> bool,
-    ) -> Vec<(u32, String)> {
-        segs.iter().flat_map(|s| s.iter()).filter(|(id, _)| live(id)).cloned().collect()
-    }
-    fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize { seg.len() }
-}
-
 let dir = MemoryDirectory::arc();
-let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+let mut s = SegmentedStore::open(dir, DefaultStore::<u32, String>::new(), 2).unwrap();
 s.add(1, "a".into()).unwrap();
 s.add(2, "b".into()).unwrap();
 s.delete(2).unwrap();
 assert!(s.is_live(&1) && !s.is_live(&2));
 ```
+
+Use `DefaultStore<Id, Item>` when a segment is just `Vec<(Id, Item)>`. Implement
+`Store` directly when a consumer needs sorted segments, replacement semantics, or
+a custom merge.
 
 ## Durability
 
@@ -95,7 +80,9 @@ For byte-native query paths, use consumer sidecars. `segstore` reserves and
 garbage-collects `segstore.idx.<segment-id>.<kind>` next to the source segment,
 but the consumer owns the sidecar format and compatibility checks. A postings
 crate can store a raw postings block there; an ANN crate can store graph pages
-there. `segstore.seg.<id>` remains the durable source payload.
+there. `SidecarEnvelope` is available for the repeated magic/version/segment-id/
+recipe/CRC byte envelope, but recipe meaning and payload decoding stay in the
+consumer. `segstore.seg.<id>` remains the durable source payload.
 
 ## Compaction
 

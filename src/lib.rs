@@ -27,35 +27,18 @@
 //! # Example
 //!
 //! ```
-//! use segstore::{SegmentedStore, Store};
+//! use segstore::{DefaultStore, SegmentedStore};
 //! use durability::MemoryDirectory;
 //!
-//! // A trivial key-value store: a segment is just a batch of (id, item) pairs.
-//! struct Kv;
-//! impl Store for Kv {
-//!     type Id = u32;
-//!     type Item = String;
-//!     type Segment = Vec<(u32, String)>;
-//!     fn build_segment(&self, batch: &[(u32, String)]) -> Vec<(u32, String)> {
-//!         batch.to_vec()
-//!     }
-//!     fn merge_segments(
-//!         &self,
-//!         segs: &[&Vec<(u32, String)>],
-//!         live: &dyn Fn(&u32) -> bool,
-//!     ) -> Vec<(u32, String)> {
-//!         segs.iter().flat_map(|s| s.iter()).filter(|(id, _)| live(id)).cloned().collect()
-//!     }
-//!     fn segment_len(&self, seg: &Vec<(u32, String)>) -> usize { seg.len() }
-//! }
-//!
 //! let dir = MemoryDirectory::arc();
-//! let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+//! let mut s = SegmentedStore::open(dir, DefaultStore::<u32, String>::new(), 2).unwrap();
 //! s.add(1, "a".into()).unwrap();
 //! s.add(2, "b".into()).unwrap();
 //! s.delete(2).unwrap();
 //! assert!(s.is_live(&1) && !s.is_live(&2));
 //! ```
+//!
+//! For custom segment layouts, implement [`Store`] directly.
 //!
 //! # Durability
 //!
@@ -113,6 +96,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::io::Read;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use durability::checkpoint::{CheckpointFile, MAX_CHECKPOINT_PAYLOAD_BYTES};
@@ -137,6 +121,7 @@ const SEG_PREFIX: &str = "segstore.seg.";
 const CHECKPOINT_MAGIC: [u8; 4] = *b"VCKP";
 const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_HEADER_BYTES: u64 = 4 + 4 + 8 + 8 + 4;
+const SIDECAR_ENVELOPE_HEADER_BYTES: usize = 8 + 4 + 8 + 4 + 4;
 
 /// The WAL file path for a given epoch.
 fn wal_path(epoch: u64) -> String {
@@ -554,6 +539,173 @@ pub trait Store {
     ) -> Option<usize> {
         None
     }
+}
+
+/// Default vec-backed segment model for append-only source batches.
+///
+/// This is the common consumer shape where each immutable segment is just
+/// `Vec<(Id, Item)>`, `build_segment` copies the sealed buffer, and compaction
+/// concatenates live entries from the merged segments. It deliberately does not
+/// implement last-write-wins or deduplication: ids are live or tombstoned exactly
+/// as in [`SegmentedStore::add`] and [`SegmentedStore::delete`]. Consumers that
+/// need sorted segments, replacement semantics, or custom merge logic should
+/// keep their own [`Store`] implementation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultStore<Id, Item> {
+    _marker: PhantomData<fn() -> (Id, Item)>,
+}
+
+impl<Id, Item> DefaultStore<Id, Item> {
+    /// Create a default vec-backed store model.
+    pub fn new() -> Self {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Id, Item> Store for DefaultStore<Id, Item>
+where
+    Id: Clone + Eq + Hash + Serialize + DeserializeOwned,
+    Item: Clone + Serialize + DeserializeOwned,
+{
+    type Id = Id;
+    type Item = Item;
+    type Segment = Vec<(Id, Item)>;
+
+    fn build_segment(&self, batch: &[(Id, Item)]) -> Self::Segment {
+        batch.to_vec()
+    }
+
+    fn merge_segments(
+        &self,
+        segments: &[&Self::Segment],
+        live: &dyn Fn(&Id) -> bool,
+    ) -> Self::Segment {
+        segments
+            .iter()
+            .flat_map(|segment| segment.iter())
+            .filter(|(id, _)| live(id))
+            .cloned()
+            .collect()
+    }
+
+    fn segment_len(&self, segment: &Self::Segment) -> usize {
+        segment.len()
+    }
+
+    fn live_len(&self, segment: &Self::Segment, live: &dyn Fn(&Id) -> bool) -> Option<usize> {
+        Some(segment.iter().filter(|(id, _)| live(id)).count())
+    }
+}
+
+/// Consumer-owned sidecar envelope with checked shared mechanics.
+///
+/// The envelope covers the repeated cross-consumer header pattern:
+/// `magic[8] | version:u32 | segment_id:u64 | recipe_len:u32 | crc32:u32 |
+/// recipe | payload`. The CRC covers every byte except the CRC field itself,
+/// so corrupt fixed header fields, recipe bytes, or payload bytes are rejected
+/// before the payload is trusted.
+///
+/// This type does not define a sidecar format for consumers. `magic`, `version`,
+/// `recipe`, and the payload codec remain consumer-owned compatibility choices;
+/// this helper only centralizes the bounds checks and CRC framing.
+pub struct SidecarEnvelope;
+
+impl SidecarEnvelope {
+    /// Encode a payload with the common sidecar envelope.
+    pub fn encode(
+        magic: &[u8; 8],
+        version: u32,
+        segment_id: u64,
+        recipe: &[u8],
+        payload: &[u8],
+    ) -> PersistenceResult<Vec<u8>> {
+        let recipe_len = u32::try_from(recipe.len()).map_err(|_| {
+            PersistenceError::InvalidConfig(format!(
+                "sidecar recipe too large: {} bytes (max {})",
+                recipe.len(),
+                u32::MAX
+            ))
+        })?;
+        let mut bytes =
+            Vec::with_capacity(SIDECAR_ENVELOPE_HEADER_BYTES + recipe.len() + payload.len());
+        bytes.extend_from_slice(magic);
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&segment_id.to_le_bytes());
+        bytes.extend_from_slice(&recipe_len.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(recipe);
+        bytes.extend_from_slice(payload);
+        let crc = sidecar_envelope_crc(&bytes);
+        bytes[24..28].copy_from_slice(&crc.to_le_bytes());
+        Ok(bytes)
+    }
+
+    /// Decode and validate a common sidecar envelope, returning the payload.
+    pub fn decode<'a>(
+        expected_magic: &[u8; 8],
+        expected_version: u32,
+        expected_segment_id: u64,
+        expected_recipe: &[u8],
+        bytes: &'a [u8],
+    ) -> PersistenceResult<&'a [u8]> {
+        if bytes.len() < SIDECAR_ENVELOPE_HEADER_BYTES {
+            return Err(PersistenceError::Format(
+                "sidecar envelope header is truncated".into(),
+            ));
+        }
+        if &bytes[..8] != expected_magic {
+            return Err(PersistenceError::Format(
+                "sidecar envelope magic mismatch".into(),
+            ));
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != expected_version {
+            return Err(PersistenceError::Format(format!(
+                "sidecar envelope version mismatch: got {version}, expected {expected_version}"
+            )));
+        }
+        let segment_id = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+        if segment_id != expected_segment_id {
+            return Err(PersistenceError::Format(format!(
+                "sidecar envelope segment id mismatch: got {segment_id}, expected {expected_segment_id}"
+            )));
+        }
+        let recipe_len = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+        let recipe_start = SIDECAR_ENVELOPE_HEADER_BYTES;
+        let recipe_end = recipe_start
+            .checked_add(recipe_len)
+            .ok_or_else(|| PersistenceError::Format("sidecar recipe length overflow".into()))?;
+        if bytes.len() < recipe_end {
+            return Err(PersistenceError::Format(
+                "sidecar envelope recipe is truncated".into(),
+            ));
+        }
+
+        let expected_crc = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let actual_crc = sidecar_envelope_crc(bytes);
+        if actual_crc != expected_crc {
+            return Err(PersistenceError::CrcMismatch {
+                expected: expected_crc,
+                actual: actual_crc,
+            });
+        }
+
+        if &bytes[recipe_start..recipe_end] != expected_recipe {
+            return Err(PersistenceError::Format(
+                "sidecar envelope recipe mismatch".into(),
+            ));
+        }
+        Ok(&bytes[recipe_end..])
+    }
+}
+
+fn sidecar_envelope_crc(bytes: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes[..24]);
+    hasher.update(&bytes[28..]);
+    hasher.finalize()
 }
 
 /// One write-ahead-log operation.
@@ -1830,6 +1982,69 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn default_store_implements_the_vec_segment_pattern() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, DefaultStore::<u32, String>::new(), 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "b".into()).unwrap();
+        assert_eq!(s.segment_count(), 1);
+        assert_eq!(
+            s.segments()[0].as_ref(),
+            &vec![(1, "a".into()), (2, "b".into())]
+        );
+
+        s.delete(2).unwrap();
+        assert_eq!(
+            s.space_amplification(),
+            Some(2.0),
+            "DefaultStore exposes live_len for tombstone policy"
+        );
+
+        s.compact().unwrap();
+        assert_eq!(s.tombstone_count(), 0);
+        assert_eq!(s.segments()[0].as_ref(), &vec![(1, "a".into())]);
+    }
+
+    #[test]
+    fn sidecar_envelope_round_trips_payload() {
+        let magic = b"SIDETST1";
+        let recipe = b"demo-v1";
+        let payload = b"payload bytes";
+
+        let bytes = SidecarEnvelope::encode(magic, 2, 7, recipe, payload).unwrap();
+        let decoded = SidecarEnvelope::decode(magic, 2, 7, recipe, &bytes).unwrap();
+
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn sidecar_envelope_rejects_corrupt_payload_by_crc() {
+        let magic = b"SIDETST1";
+        let recipe = b"demo-v1";
+        let mut bytes = SidecarEnvelope::encode(magic, 2, 7, recipe, b"payload").unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        let err = SidecarEnvelope::decode(magic, 2, 7, recipe, &bytes).unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::CrcMismatch { .. }),
+            "corrupt sidecar bytes should fail CRC, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_envelope_distinguishes_stale_recipe_from_corruption() {
+        let magic = b"SIDETST1";
+        let bytes = SidecarEnvelope::encode(magic, 2, 7, b"demo-v1", b"payload").unwrap();
+
+        let err = SidecarEnvelope::decode(magic, 2, 7, b"demo-v2", &bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("recipe mismatch"),
+            "valid but stale sidecars should be rebuildable mismatches, got: {err}"
+        );
     }
 
     #[test]

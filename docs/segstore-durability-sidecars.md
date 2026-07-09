@@ -32,7 +32,10 @@ Harden the existing contracts before adding broader APIs:
    `index_name` convenience method panics on invalid sidecar kinds.
 3. Segstore accepts legacy sidecar names with now-invalid kinds for garbage
    collection, so upgrading does not strand old derived artifacts.
-4. Consumer sidecars must carry their own validity data, such as format version
+4. Segstore exposes `SidecarEnvelope` for the repeated magic/version/segment-id/
+   recipe/CRC framing used by consumers. It is a byte envelope, not a sidecar
+   recipe system.
+5. Consumer sidecars must carry their own validity data, such as format version
    and algorithm/config assumptions. Missing, corrupt, or mismatched sidecars
    must be rebuilt from the raw segment.
 
@@ -73,6 +76,21 @@ If a future consumer needs a persisted artifact that is not rebuildable from
 source segments, that is the decision gate for manifest-tracked index
 generations. It is not a reason to put query encodings or algorithm recipes into
 segstore's current sidecar namespace.
+
+External mechanism check: Lucene's file-format docs describe segments as
+independent indexes created for new documents and merged over time, with a
+`segments_N` commit file naming the active set and file names that are never
+reused. Its codec utilities validate file-local headers with codec, version,
+object id, and suffix, and write a footer carrying a checksum algorithm id plus
+the checksum for the preceding stream bytes. That supports the current split:
+segstore should own the active segment set and source payload integrity, while a
+consumer sidecar should carry its own magic/version/segment-id/recipe/CRC proof.
+It does not justify moving consumer recipes into segstore's manifest.
+
+Sources:
+
+- <https://lucene.apache.org/core/9_11_1/core/org/apache/lucene/codecs/lucene99/package-summary.html>
+- <https://lucene.apache.org/core/9_11_1/core/org/apache/lucene/codecs/CodecUtil.html>
 
 ## Per-Consumer Sidecar Recipes
 

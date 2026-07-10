@@ -676,6 +676,35 @@ where
 /// this helper only centralizes the bounds checks and CRC framing.
 pub struct SidecarEnvelope;
 
+/// Payload range described by a sidecar envelope header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SidecarPayloadInfo {
+    payload_offset: u64,
+    payload_len: u64,
+    crc32: u32,
+}
+
+impl SidecarPayloadInfo {
+    /// Byte offset of the payload inside the containing sidecar file.
+    pub fn payload_offset(self) -> u64 {
+        self.payload_offset
+    }
+
+    /// Byte length of the payload inside the containing sidecar file.
+    pub fn payload_len(self) -> u64 {
+        self.payload_len
+    }
+
+    /// Stored envelope CRC32.
+    ///
+    /// [`SidecarEnvelope::payload_info`] returns this value without verifying
+    /// it, so lazy readers can decide whether to verify the full envelope or
+    /// rely on payload-format checksums.
+    pub fn crc32(self) -> u32 {
+        self.crc32
+    }
+}
+
 impl SidecarEnvelope {
     /// Encode a payload with the common sidecar envelope.
     pub fn encode(
@@ -762,6 +791,77 @@ impl SidecarEnvelope {
             ));
         }
         Ok(&bytes[recipe_end..])
+    }
+
+    /// Read and validate the sidecar header/recipe, returning the payload range.
+    ///
+    /// This reads only the fixed header and recipe from `reader`, which must be
+    /// positioned at the start of the sidecar. It does not verify the stored
+    /// envelope CRC over the payload; use [`Self::decode`] when the full sidecar
+    /// is already resident and must be fully verified before use. This helper is
+    /// for payload formats that have their own lazy checksums and need to keep
+    /// the payload file-backed.
+    pub fn payload_info<R: Read + ?Sized>(
+        expected_magic: &[u8; 8],
+        expected_version: u32,
+        expected_segment_id: u64,
+        expected_recipe: &[u8],
+        reader: &mut R,
+        sidecar_len: u64,
+    ) -> PersistenceResult<SidecarPayloadInfo> {
+        if sidecar_len < SIDECAR_ENVELOPE_HEADER_BYTES as u64 {
+            return Err(PersistenceError::Format(
+                "sidecar envelope header is truncated".into(),
+            ));
+        }
+
+        let mut header = [0u8; SIDECAR_ENVELOPE_HEADER_BYTES];
+        reader.read_exact(&mut header)?;
+        if &header[..8] != expected_magic {
+            return Err(PersistenceError::Format(
+                "sidecar envelope magic mismatch".into(),
+            ));
+        }
+        let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        if version != expected_version {
+            return Err(PersistenceError::Format(format!(
+                "sidecar envelope version mismatch: got {version}, expected {expected_version}"
+            )));
+        }
+        let segment_id = u64::from_le_bytes(header[12..20].try_into().unwrap());
+        if segment_id != expected_segment_id {
+            return Err(PersistenceError::Format(format!(
+                "sidecar envelope segment id mismatch: got {segment_id}, expected {expected_segment_id}"
+            )));
+        }
+        let recipe_len = u32::from_le_bytes(header[20..24].try_into().unwrap()) as u64;
+        let payload_offset = (SIDECAR_ENVELOPE_HEADER_BYTES as u64)
+            .checked_add(recipe_len)
+            .ok_or_else(|| PersistenceError::Format("sidecar recipe length overflow".into()))?;
+        if sidecar_len < payload_offset {
+            return Err(PersistenceError::Format(
+                "sidecar envelope recipe is truncated".into(),
+            ));
+        }
+        if recipe_len != expected_recipe.len() as u64 {
+            return Err(PersistenceError::Format(
+                "sidecar envelope recipe mismatch".into(),
+            ));
+        }
+
+        let mut recipe = vec![0; expected_recipe.len()];
+        reader.read_exact(&mut recipe)?;
+        if recipe != expected_recipe {
+            return Err(PersistenceError::Format(
+                "sidecar envelope recipe mismatch".into(),
+            ));
+        }
+
+        Ok(SidecarPayloadInfo {
+            payload_offset,
+            payload_len: sidecar_len - payload_offset,
+            crc32: u32::from_le_bytes(header[24..28].try_into().unwrap()),
+        })
     }
 }
 
@@ -2085,6 +2185,28 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_envelope_reports_payload_info_without_full_decode() {
+        let magic = b"SIDETST1";
+        let recipe = b"demo-v1";
+        let payload = b"payload bytes";
+        let bytes = SidecarEnvelope::encode(magic, 2, 7, recipe, payload).unwrap();
+        let mut reader = &bytes[..];
+
+        let info =
+            SidecarEnvelope::payload_info(magic, 2, 7, recipe, &mut reader, bytes.len() as u64)
+                .unwrap();
+
+        let expected_offset = (SIDECAR_ENVELOPE_HEADER_BYTES + recipe.len()) as u64;
+        assert_eq!(info.payload_offset(), expected_offset);
+        assert_eq!(info.payload_len(), payload.len() as u64);
+        assert_eq!(
+            info.crc32(),
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap())
+        );
+        assert_eq!(&bytes[info.payload_offset() as usize..], payload);
+    }
+
+    #[test]
     fn sidecar_envelope_rejects_corrupt_payload_by_crc() {
         let magic = b"SIDETST1";
         let recipe = b"demo-v1";
@@ -2108,6 +2230,37 @@ mod tests {
         assert!(
             err.to_string().contains("recipe mismatch"),
             "valid but stale sidecars should be rebuildable mismatches, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_envelope_payload_info_distinguishes_stale_recipe() {
+        let magic = b"SIDETST1";
+        let bytes = SidecarEnvelope::encode(magic, 2, 7, b"demo-v1", b"payload").unwrap();
+        let mut reader = &bytes[..];
+
+        let err =
+            SidecarEnvelope::payload_info(magic, 2, 7, b"demo-v2", &mut reader, bytes.len() as u64)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("recipe mismatch"),
+            "valid but stale sidecars should be rebuildable mismatches, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_envelope_payload_info_rejects_corrupt_recipe_length() {
+        let magic = b"SIDETST1";
+        let mut bytes = SidecarEnvelope::encode(magic, 2, 7, b"demo-v1", b"payload").unwrap();
+        bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut reader = &bytes[..];
+
+        let err =
+            SidecarEnvelope::payload_info(magic, 2, 7, b"demo-v1", &mut reader, bytes.len() as u64)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("recipe is truncated"),
+            "corrupt recipe lengths should fail before reading payload bytes, got: {err}"
         );
     }
 

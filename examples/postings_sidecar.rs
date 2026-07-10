@@ -7,14 +7,17 @@
 //! Run: `cargo run --example postings_sidecar`
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::fs::File;
 
 use durability::{Directory, FsDirectory};
-use postings::raw::{write_u64_u32_segment_from_term_postings, RawSegment, RawTermPostingList};
-use segstore::{SegmentCatalog, SegmentedStore, Store};
+use postings::raw::{write_u64_u32_segment_from_term_postings, RawSegmentFile, RawTermPostingList};
+use segstore::{SegmentCatalog, SegmentedStore, SidecarEnvelope, Store};
 use serde::{Deserialize, Serialize};
 
 const SIDECAR_KIND: &str = "postings_raw";
+const SIDECAR_MAGIC: &[u8; 8] = b"PSTRSC01";
+const SIDECAR_VERSION: u32 = 1;
+const SIDECAR_RECIPE: &[u8] = b"u64-u32-v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Document {
@@ -99,7 +102,15 @@ fn build_raw_postings(segment: &[(u32, Document)]) -> Vec<u8> {
 fn persist_postings_sidecars(store: &SegmentedStore<SearchSegments>, dir: &dyn Directory) {
     for (idx, &segment_id) in store.segment_ids().iter().enumerate() {
         let bytes = build_raw_postings(&store.segments()[idx]);
-        dir.atomic_write(&store.index_name(segment_id, SIDECAR_KIND), &bytes)
+        let sidecar = SidecarEnvelope::encode(
+            SIDECAR_MAGIC,
+            SIDECAR_VERSION,
+            segment_id,
+            SIDECAR_RECIPE,
+            &bytes,
+        )
+        .expect("postings sidecar envelope is valid");
+        dir.atomic_write(&store.index_name(segment_id, SIDECAR_KIND), &sidecar)
             .expect("write postings sidecar");
     }
 }
@@ -109,16 +120,27 @@ fn query_sidecars(catalog: &SegmentCatalog<u32>, term_id: u64) -> Vec<u32> {
 
     for &segment_id in catalog.segment_ids() {
         let sidecar = catalog.index_name(segment_id, SIDECAR_KIND);
-        let mut bytes = Vec::new();
-        let mut reader = catalog
+        let path = catalog
             .dir()
-            .open_file(&sidecar)
-            .expect("postings sidecar exists");
-        reader
-            .read_to_end(&mut bytes)
-            .expect("read postings sidecar");
-
-        let raw = RawSegment::open(&bytes).expect("open postings sidecar");
+            .file_path(&sidecar)
+            .expect("example uses FsDirectory");
+        let mut envelope = File::open(&path).expect("postings sidecar exists");
+        let sidecar_len = envelope.metadata().expect("sidecar metadata").len();
+        let payload = SidecarEnvelope::payload_info(
+            SIDECAR_MAGIC,
+            SIDECAR_VERSION,
+            segment_id,
+            SIDECAR_RECIPE,
+            &mut envelope,
+            sidecar_len,
+        )
+        .expect("open postings sidecar envelope");
+        let mut raw = RawSegmentFile::from_file_range(
+            File::open(&path).expect("postings sidecar exists"),
+            payload.payload_offset(),
+            payload.payload_len(),
+        )
+        .expect("open raw postings payload");
         let docs = raw
             .candidates_any_terms(&[term_id])
             .expect("query postings sidecar");

@@ -66,8 +66,15 @@ The code now has tests and APIs for this split:
 - `SegmentCatalog::segment_payload_info` exposes payload offset, length, and CRC
   for mmap/range-read sidecar builders without turning segstore into a query
   reader.
+- `SidecarEnvelope::payload_info` validates a sidecar's magic, version, segment
+  id, and recipe without reading the payload. Consumers whose payload format has
+  its own checksums can then open the returned payload byte range with a
+  file-backed reader.
 - `RawSegmentFile::resident_metadata_len` and
   `RawSegmentFile::posting_payload_len` expose the postings memory split.
+- `RawSegmentFile::from_file_range` opens a raw postings segment embedded inside
+  a lifecycle-owned sidecar envelope while keeping raw-format offsets relative to
+  the payload start.
 - `RawSegmentFile::for_each_term_meta` streams term statistics from the directory
   without reading posting payloads; `lexir::RawBm25CorpusStats` uses that path for
   all-term corpus statistics.

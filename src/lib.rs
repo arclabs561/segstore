@@ -119,7 +119,8 @@ const MANIFEST_PATH: &str = "segstore.manifest";
 /// segment, written once and never rewritten.
 const SEG_PREFIX: &str = "segstore.seg.";
 const CHECKPOINT_MAGIC: [u8; 4] = *b"VCKP";
-const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_FORMAT_VERSION_V1: u32 = 1;
+const CHECKPOINT_FORMAT_VERSION_V2: u32 = 2;
 const CHECKPOINT_HEADER_BYTES: u64 = 4 + 4 + 8 + 8 + 4;
 const SIDECAR_ENVELOPE_HEADER_BYTES: usize = 8 + 4 + 8 + 4 + 4;
 
@@ -283,7 +284,7 @@ impl SegmentPayloadInfo {
 
 fn read_checkpoint_payload_header<R: Read + ?Sized>(
     f: &mut R,
-) -> PersistenceResult<SegmentPayloadInfo> {
+) -> PersistenceResult<CheckpointPayloadHeader> {
     let mut buf4 = [0u8; 4];
     let mut buf8 = [0u8; 8];
 
@@ -294,30 +295,86 @@ fn read_checkpoint_payload_header<R: Read + ?Sized>(
 
     f.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    if version != CHECKPOINT_FORMAT_VERSION {
-        return Err(PersistenceError::Format(
-            "checkpoint version mismatch".into(),
-        ));
+    if !matches!(
+        version,
+        CHECKPOINT_FORMAT_VERSION_V1 | CHECKPOINT_FORMAT_VERSION_V2
+    ) {
+        return Err(PersistenceError::Format(format!(
+            "checkpoint version mismatch (got {version})"
+        )));
     }
 
-    f.read_exact(&mut buf8)?; // last_applied_id is not used for segment payload reads.
     f.read_exact(&mut buf8)?;
-    let len = usize::try_from(u64::from_le_bytes(buf8))
+    let last_applied_id = u64::from_le_bytes(buf8);
+    f.read_exact(&mut buf8)?;
+    let payload_len_u64 = u64::from_le_bytes(buf8);
+    let payload_len = usize::try_from(payload_len_u64)
         .map_err(|_| PersistenceError::Format("payload_len overflow".into()))?;
-    if len > MAX_CHECKPOINT_PAYLOAD_BYTES {
+    if payload_len > MAX_CHECKPOINT_PAYLOAD_BYTES {
         return Err(PersistenceError::Format(format!(
             "checkpoint payload too large: {} bytes (max {})",
-            len, MAX_CHECKPOINT_PAYLOAD_BYTES
+            payload_len, MAX_CHECKPOINT_PAYLOAD_BYTES
         )));
     }
 
     f.read_exact(&mut buf4)?;
-    let expected = u32::from_le_bytes(buf4);
-    Ok(SegmentPayloadInfo {
-        payload_offset: CHECKPOINT_HEADER_BYTES,
-        payload_len: len,
-        payload_crc32: expected,
+    let checksum = u32::from_le_bytes(buf4);
+    Ok(CheckpointPayloadHeader {
+        version,
+        last_applied_id,
+        payload_len_u64,
+        payload_len,
+        checksum,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckpointPayloadHeader {
+    version: u32,
+    last_applied_id: u64,
+    payload_len_u64: u64,
+    payload_len: usize,
+    checksum: u32,
+}
+
+impl CheckpointPayloadHeader {
+    fn verify_payload(&self, payload: &[u8]) -> PersistenceResult<()> {
+        if payload.len() != self.payload_len {
+            return Err(PersistenceError::Format(format!(
+                "checkpoint payload truncated: got {} of {} bytes",
+                payload.len(),
+                self.payload_len
+            )));
+        }
+        let actual = match self.version {
+            CHECKPOINT_FORMAT_VERSION_V1 => crc32fast::hash(payload),
+            CHECKPOINT_FORMAT_VERSION_V2 => {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&CHECKPOINT_MAGIC);
+                hasher.update(&self.version.to_le_bytes());
+                hasher.update(&self.last_applied_id.to_le_bytes());
+                hasher.update(&self.payload_len_u64.to_le_bytes());
+                hasher.update(payload);
+                hasher.finalize()
+            }
+            _ => unreachable!("checkpoint header version is validated at parse time"),
+        };
+        if actual != self.checksum {
+            return Err(PersistenceError::CrcMismatch {
+                expected: self.checksum,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn payload_info(&self, payload: &[u8]) -> SegmentPayloadInfo {
+        SegmentPayloadInfo {
+            payload_offset: CHECKPOINT_HEADER_BYTES,
+            payload_len: self.payload_len,
+            payload_crc32: crc32fast::hash(payload),
+        }
+    }
 }
 
 fn read_checkpoint_payload_info(
@@ -325,7 +382,10 @@ fn read_checkpoint_payload_info(
     path: &str,
 ) -> PersistenceResult<SegmentPayloadInfo> {
     let mut f = dir.open_file(path)?;
-    read_checkpoint_payload_header(&mut *f)
+    let header = read_checkpoint_payload_header(&mut *f)?;
+    let mut payload = Vec::new();
+    read_checkpoint_payload_into_reader(&mut *f, &header, &mut payload)?;
+    Ok(header.payload_info(&payload))
 }
 
 fn read_checkpoint_payload_into(
@@ -334,34 +394,38 @@ fn read_checkpoint_payload_into(
     payload: &mut Vec<u8>,
 ) -> PersistenceResult<()> {
     let mut f = dir.open_file(path)?;
-    let info = read_checkpoint_payload_header(&mut *f)?;
+    let header = read_checkpoint_payload_header(&mut *f)?;
+    match read_checkpoint_payload_into_reader(&mut *f, &header, payload) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            payload.clear();
+            Err(err)
+        }
+    }
+}
+
+fn read_checkpoint_payload_into_reader<R: Read + ?Sized>(
+    f: &mut R,
+    header: &CheckpointPayloadHeader,
+    payload: &mut Vec<u8>,
+) -> PersistenceResult<()> {
     // Don't trust `len` for the upfront allocation: a corrupt length prefix
     // under the cap would otherwise force a zeroed allocation up to 256 MiB
     // before the read fails. Grow with the bytes actually present instead
     // (mirrors durability's read_exact_bounded).
     payload.clear();
-    let reserve = info.payload_len.min(1 << 20);
+    let reserve = header.payload_len.min(1 << 20);
     if payload.capacity() < reserve {
         payload.reserve(reserve - payload.capacity());
     }
-    let n = match std::io::Read::take(&mut *f, info.payload_len as u64).read_to_end(payload) {
-        Ok(n) => n,
-        Err(e) => {
-            payload.clear();
-            return Err(e.into());
-        }
-    };
-    if n < info.payload_len {
-        payload.clear();
+    let n = std::io::Read::take(&mut *f, header.payload_len as u64).read_to_end(payload)?;
+    if n < header.payload_len {
         return Err(PersistenceError::Format(format!(
             "checkpoint payload truncated: got {n} of {} bytes",
-            info.payload_len
+            header.payload_len
         )));
     }
-    if let Err(err) = info.verify_payload(payload) {
-        payload.clear();
-        return Err(err);
-    }
+    header.verify_payload(payload)?;
     Ok(())
 }
 
@@ -853,12 +917,12 @@ where
 
     /// Read one segment file's header and return where its serialized payload lives.
     ///
-    /// This validates the checkpoint envelope header (magic, version, and payload
-    /// length cap), but it does not read or CRC-check the payload bytes. Use this
+    /// This validates the checkpoint envelope and reads the payload bytes once
+    /// to compute the public payload CRC. Use the returned offset and length
     /// with [`Self::segment_file_path`] for mmap/range-read sidecar rebuilders,
     /// then verify [`SegmentPayloadInfo::payload_crc32`] over the mapped bytes
-    /// before trusting them. If you want segstore to do the full validation and
-    /// read, use [`Self::read_segment_payload`] or
+    /// before trusting them. If you want segstore to return the payload bytes
+    /// directly, use [`Self::read_segment_payload`] or
     /// [`Self::read_segment_payload_into`].
     pub fn segment_payload_info(&self, id: u64) -> PersistenceResult<SegmentPayloadInfo> {
         read_checkpoint_payload_info(&*self.dir, &self.segment_name(id)?)

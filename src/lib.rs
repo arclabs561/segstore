@@ -903,7 +903,7 @@ struct ManifestRef<'a, Id> {
 }
 
 /// The reader-visible published state: the segments and tombstones as of the last
-/// mutation, behind `Arc`s so a [`View`] is a cheap, consistent snapshot.
+/// checkpoint, behind `Arc`s so a [`View`] is a cheap, consistent snapshot.
 struct PubState<S: Store> {
     segments: Arc<Vec<Arc<S::Segment>>>,
     segment_ids: Arc<Vec<u64>>,
@@ -1180,7 +1180,7 @@ pub struct SegmentedStore<S: Store> {
     segments: Vec<Arc<S::Segment>>,
     /// Logically-deleted ids.
     tombstones: HashSet<S::Id>,
-    /// Published snapshot for concurrent readers (rebuilt on each mutation).
+    /// Published snapshot for concurrent readers (rebuilt on each checkpoint).
     published: Arc<std::sync::RwLock<Arc<PubState<S>>>>,
     wal: RecordLogWriter,
     /// Current WAL generation; the live WAL is `segstore.wal.<epoch>` and the
@@ -1263,6 +1263,11 @@ impl<S: Store> SegmentedStore<S> {
                 segment_ids.push(id);
             }
         }
+        // Reader visibility is checkpoint-only, so retain the manifest state before
+        // WAL replay reconstructs the writer's newer, uncommitted state.
+        let published_segments = segments.clone();
+        let published_segment_ids = segment_ids.clone();
+        let published_tombstones = tombstones.clone();
         let persisted_ids: HashSet<u64> = segment_ids.iter().copied().collect();
         let durable = dir.file_path(MANIFEST_PATH).is_some();
 
@@ -1276,6 +1281,15 @@ impl<S: Store> SegmentedStore<S> {
                 reader.read_all_postcard(RecordLogReadMode::BestEffort)?;
             for op in ops {
                 apply(&mut buffer, &mut tombstones, op);
+                // Reconstruct the same immutable segment boundaries as live writes.
+                // Otherwise a long WAL epoch becomes one oversized buffer on reopen.
+                if !buffer.is_empty() && buffer.len() >= flush_threshold {
+                    let seg = store.build_segment(&buffer);
+                    segments.push(Arc::new(seg));
+                    segment_ids.push(next_seg_id);
+                    next_seg_id += 1;
+                    buffer.clear();
+                }
             }
         }
 
@@ -1312,9 +1326,9 @@ impl<S: Store> SegmentedStore<S> {
 
         let wal = RecordLogWriter::new(dir.clone(), live_wal);
         let published = Arc::new(std::sync::RwLock::new(Arc::new(PubState {
-            segments: Arc::new(segments.clone()),
-            segment_ids: Arc::new(segment_ids.clone()),
-            tombstones: Arc::new(tombstones.clone()),
+            segments: Arc::new(published_segments),
+            segment_ids: Arc::new(published_segment_ids),
+            tombstones: Arc::new(published_tombstones),
         })));
         Ok(Self {
             store,
@@ -2281,6 +2295,56 @@ mod tests {
             "second add hits threshold 2 and flushes"
         );
         assert!(s.buffer().is_empty());
+    }
+
+    #[test]
+    fn wal_replay_preserves_flush_threshold() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), Kv, 3).unwrap();
+        for id in 0..65 {
+            s.add(id, format!("v{id}")).unwrap();
+        }
+        drop(s);
+
+        let mut reopened = SegmentedStore::open(dir, Kv, 3).unwrap();
+        assert_eq!(reopened.segment_sizes(), vec![3; 21]);
+        assert_eq!(reopened.buffer().len(), 2);
+
+        reopened.add(65, "v65".into()).unwrap();
+        assert_eq!(reopened.segment_sizes(), vec![3; 22]);
+        assert!(reopened.buffer().is_empty());
+        assert_eq!(live_set(&reopened).len(), 66);
+    }
+
+    #[test]
+    fn wal_replay_preserves_checkpoint_visibility() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "b".into()).unwrap();
+        s.checkpoint().unwrap();
+
+        s.add(3, "c".into()).unwrap();
+        s.add(4, "d".into()).unwrap();
+        s.delete(1).unwrap();
+        drop(s);
+
+        let mut reopened = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(
+            live_set(&reopened),
+            vec![(2, "b".into()), (3, "c".into()), (4, "d".into())]
+        );
+
+        let before_checkpoint = reopened.reader().view();
+        assert_eq!(before_checkpoint.segment_count(), 1);
+        assert!(before_checkpoint.is_live(&1));
+        assert_eq!(before_checkpoint.segment_ids(), &[0]);
+
+        reopened.checkpoint().unwrap();
+        let after_checkpoint = reopened.reader().view();
+        assert_eq!(after_checkpoint.segment_count(), 2);
+        assert!(!after_checkpoint.is_live(&1));
+        assert_eq!(after_checkpoint.segment_ids(), &[0, 1]);
     }
 
     #[test]

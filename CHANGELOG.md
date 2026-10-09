@@ -7,8 +7,17 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-09
+
 ### Changed
 
+- Updated `durability` to 0.8. The store API takes `Arc<dyn durability::Directory>`,
+  so callers must use durability 0.8 as well.
+- Opening a store takes an exclusive OS lock on `segstore.lock` for the
+  store's lifetime. Before, two processes could open one store and one
+  deleted the WAL epoch the other was appending to, losing acknowledged
+  writes. The kernel releases the lock on exit, so a crash leaves no stale
+  lock. Backends without a filesystem path skip it.
 - A re-add now replaces the id's previous value (last write wins). Before, a
   re-add of an id whose copy was already sealed left both copies live, and a
   delete followed by an add revived the deleted copy. The buffered copy is
@@ -28,6 +37,12 @@ unstable: minor bumps may break the public API and the on-disk format.
 - `Store::item_ids`, a provided method (default `None`) that lists a segment's
   ids. `DefaultStore` implements it. A store that does not keeps the previous
   behavior for sealed copies.
+
+### Fixed
+
+- WAL replay seals the same batches as live writes. Before, recovery gathered
+  a whole epoch into one buffer, so a reopen could produce a segment that
+  bypassed the flush threshold and the tier cap.
 
 ## [0.5.0] - 2026-07-09
 

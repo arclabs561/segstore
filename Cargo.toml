@@ -1,6 +1,6 @@
 [package]
 name = "segstore"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,7 @@ include = ["/src", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LIC
 
 [dependencies]
 crc32fast = "1"
-durability = "0.7.2"
+durability = "0.8"
 fs4 = "0.13"
 serde = { version = "1", features = ["derive"] }
 

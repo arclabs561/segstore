@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 //! Generic durable segmented store.
 //!
 //! `segstore` provides the LSM-style lifecycle shared by updatable indexes,
@@ -95,7 +96,6 @@
 //! segment file handles (or mmap-backed consumer readers) while preserving the
 //! same manifest, checkpoint, and garbage-collection invariants.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::Read;
@@ -1953,7 +1953,7 @@ impl<S: Store> SegmentedStore<S> {
         if elig.len() < min_merge {
             return None;
         }
-        elig.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        elig.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         // Cassandra-style bucketing: join the first bucket whose running average is
         // within the size band, else open a new bucket.
@@ -1969,7 +1969,7 @@ impl<S: Store> SegmentedStore<S> {
             }
             buckets.push((sz, vec![(raw, idx)]));
         }
-        buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         for (_, mut members) in buckets {
             if members.len() < min_merge {
@@ -2950,6 +2950,41 @@ mod tests {
             "the torn final record is dropped; the prefix survives"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Writes acknowledged after a torn tail was recovered must survive the
+    /// next reopen. Appending them behind the torn bytes made every later open
+    /// fail with a CRC mismatch, so the whole store became unopenable.
+    #[test]
+    #[ignore = "needs durability > 0.7.2, which repairs the record log tail before appending"]
+    fn writes_after_torn_tail_recovery_survive_reopen() {
+        let root = temp_root("torn-wal-then-write");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 100).unwrap();
+            s.add(1, "aaaa".into()).unwrap();
+            s.add(2, "bbbb".into()).unwrap(); // this record's tail gets torn
+        }
+        let wal = root.join(wal_path(0));
+        let bytes = std::fs::read(&wal).unwrap();
+        std::fs::write(&wal, &bytes[..bytes.len() - 3]).unwrap();
+
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 100).unwrap();
+            assert_eq!(live_set(&s), vec![(1, "aaaa".into())]);
+            s.add(3, "cccc".into()).unwrap();
+            s.add(4, "dddd".into()).unwrap();
+        }
+
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let s = SegmentedStore::open(dir, Kv, 100)
+            .expect("writes acknowledged after recovery must not make the store unopenable");
+        assert_eq!(
+            live_set(&s),
+            vec![(1, "aaaa".into()), (3, "cccc".into()), (4, "dddd".into())]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

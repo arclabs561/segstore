@@ -62,7 +62,8 @@ The code now has tests and APIs for this split:
   Corrupt segment payloads do not prevent catalog inspection, while payload reads
   still CRC-check and fail.
 - `SegmentCatalog::read_segment` returns the source segment as written. It does
-  not apply tombstones; callers must check `SegmentCatalog::is_live`.
+  not apply tombstones or drop superseded copies; callers must check
+  `SegmentCatalog::is_live_in`.
 - `SegmentCatalog::segment_payload_info` exposes payload offset, length, and CRC
   for mmap/range-read sidecar builders without turning segstore into a query
   reader.

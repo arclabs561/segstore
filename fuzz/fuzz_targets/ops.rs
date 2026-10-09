@@ -89,7 +89,8 @@ fuzz_target!(|ops: Vec<Op>| {
     };
     let mut s = SegmentedStore::open_with_options(dir.clone(), Kv, mk()).unwrap();
     // Reference model: last-write-wins live id -> item. Add uses unique ids
-    // (segstore makes no dedup promise), so the model stays exact.
+    // (this fuzz Kv has no `Store::item_ids`, so sealed copies are not
+    // replaced), so the model stays exact.
     let mut model: BTreeMap<u32, String> = BTreeMap::new();
     let mut live_ids: Vec<u32> = Vec::new();
     let mut next_id = 0u32;

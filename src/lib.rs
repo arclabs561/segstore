@@ -22,7 +22,7 @@
 //!   how a batch of live items becomes one segment ([`Store::build_segment`]),
 //!   how segments merge while dropping tombstoned ids ([`Store::merge_segments`]),
 //!   and querying (iterate [`SegmentedStore::segments`] + [`SegmentedStore::buffer`],
-//!   filtering with [`SegmentedStore::is_live`]).
+//!   filtering each segment's copies with [`SegmentedStore::is_live_in`]).
 //!
 //! # Example
 //!
@@ -80,7 +80,10 @@
 //! On-disk format note: 0.3 replaced 0.2's single monolithic `segstore.ckpt`
 //! checkpoint blob with the manifest + per-segment-file layout above. A 0.1
 //! unsuffixed `segstore.wal` and a 0.2 `segstore.ckpt` (with no manifest) are each
-//! detected and rejected with a clear error rather than misread.
+//! detected and rejected with a clear error rather than misread. The manifest
+//! now ends with a versioned extension listing superseded copies (see
+//! [`SegmentedStore::add`]); a manifest without it is read as having none, and
+//! an older segstore that does not know the extension ignores it.
 //!
 //! # Memory model
 //!
@@ -93,7 +96,7 @@
 //! same manifest, checkpoint, and garbage-collection invariants.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::Read;
 use std::marker::PhantomData;
@@ -606,17 +609,32 @@ pub trait Store {
     ) -> Option<usize> {
         None
     }
+
+    /// The ids of every item in `segment`, or `None` if the consumer cannot list
+    /// them. A store must answer the same way for every segment.
+    ///
+    /// Returning `Some` turns on replace semantics across sealed segments: a
+    /// re-add or delete of an id marks its older sealed copy superseded, so
+    /// [`SegmentedStore::is_live_in`] (and the [`View`] and [`SegmentCatalog`]
+    /// forms) report only the newest copy and merges drop the rest. segstore
+    /// calls this when it opens a store and on each merge output, to learn
+    /// which segment holds each id's live copy. With the default `None`, a
+    /// re-add still replaces a copy that is in the buffer, but an older copy in
+    /// a sealed segment stays live next to the new one.
+    fn item_ids(&self, _segment: &Self::Segment) -> Option<Vec<Self::Id>> {
+        None
+    }
 }
 
 /// Default vec-backed segment model for append-only source batches.
 ///
 /// This is the common consumer shape where each immutable segment is just
 /// `Vec<(Id, Item)>`, `build_segment` copies the sealed buffer, and compaction
-/// concatenates live entries from the merged segments. It deliberately does not
-/// implement last-write-wins or deduplication: ids are live or tombstoned exactly
-/// as in [`SegmentedStore::add`] and [`SegmentedStore::delete`]. Consumers that
-/// need sorted segments, replacement semantics, or custom merge logic should
-/// keep their own [`Store`] implementation.
+/// concatenates live entries from the merged segments. It implements
+/// [`Store::item_ids`], so a re-add replaces the older copy (last write wins)
+/// as described on [`SegmentedStore::add`]. Consumers that need sorted
+/// segments or custom merge logic should keep their own [`Store`]
+/// implementation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultStore<Id, Item> {
     _marker: PhantomData<fn() -> (Id, Item)>,
@@ -663,6 +681,10 @@ where
 
     fn live_len(&self, segment: &Self::Segment, live: &dyn Fn(&Id) -> bool) -> Option<usize> {
         Some(segment.iter().filter(|(id, _)| live(id)).count())
+    }
+
+    fn item_ids(&self, segment: &Self::Segment) -> Option<Vec<Id>> {
+        Some(segment.iter().map(|(id, _)| id.clone()).collect())
     }
 }
 
@@ -888,6 +910,9 @@ enum Op<Id, Item> {
 /// so a checkpoint writes only the *new* segments plus this small manifest
 /// (O(delta), not O(total)). The epoch lives in the [`CheckpointFile`] header,
 /// not the body. This owned form is the *read* side (recovery decodes into it).
+///
+/// This is the original layout, which ends after the tombstones. Current writers
+/// append a [`ManifestExt`]; see [`ManifestV2`].
 #[derive(Deserialize)]
 struct Manifest<Id> {
     next_seg_id: u64,
@@ -895,14 +920,113 @@ struct Manifest<Id> {
     tombstones: Vec<Id>,
 }
 
+/// Version of the [`ManifestExt`] layout that current writers append.
+const MANIFEST_EXT_VERSION: u32 = 1;
+
+/// The current manifest: the original fields, then a versioned extension.
+/// Appending keeps older readers working: postcard decodes the leading fields
+/// and ignores trailing bytes, so an older segstore reads this as a
+/// [`Manifest`] (and loses only the superseded-copy information).
+#[derive(Deserialize)]
+struct ManifestV2<Id> {
+    next_seg_id: u64,
+    segment_ids: Vec<u64>,
+    tombstones: Vec<Id>,
+    ext: ManifestExt<Id>,
+}
+
+/// Manifest extension, version [`MANIFEST_EXT_VERSION`].
+#[derive(Deserialize)]
+struct ManifestExt<Id> {
+    version: u32,
+    /// Per segment id, the ids whose copy in that segment was superseded by a
+    /// later add or delete.
+    superseded: Vec<(u64, Vec<Id>)>,
+}
+
 /// Borrowing view of the manifest for *writing*: serializes the ids + tombstones
-/// in place. Wire-identical to [`Manifest`] (postcard encodes a struct as its
+/// in place. Wire-identical to [`ManifestV2`] (postcard encodes a struct as its
 /// fields in order, and a `&[&Id]` as the same sequence as a `Vec<Id>`).
 #[derive(Serialize)]
 struct ManifestRef<'a, Id> {
     next_seg_id: u64,
     segment_ids: &'a [u64],
     tombstones: &'a [&'a Id],
+    ext: ManifestExtRef<'a, Id>,
+}
+
+/// Borrowing write form of [`ManifestExt`].
+#[derive(Serialize)]
+struct ManifestExtRef<'a, Id> {
+    version: u32,
+    superseded: &'a [(u64, Vec<&'a Id>)],
+}
+
+/// A decoded manifest of either layout.
+struct LoadedManifest<Id> {
+    epoch: u64,
+    next_seg_id: u64,
+    segment_ids: Vec<u64>,
+    tombstones: HashSet<Id>,
+    superseded: HashMap<u64, HashSet<Id>>,
+}
+
+/// Read the manifest in `dir`, if there is one.
+fn read_manifest<Id>(dir: &Arc<dyn Directory>) -> PersistenceResult<Option<LoadedManifest<Id>>>
+where
+    Id: Eq + Hash + DeserializeOwned,
+{
+    if !dir.exists(MANIFEST_PATH) {
+        return Ok(None);
+    }
+    let ckpt = CheckpointFile::new(dir.clone());
+    let loaded = match ckpt.read_postcard::<ManifestV2<Id>>(MANIFEST_PATH) {
+        Ok((epoch, m)) => {
+            if m.ext.version != MANIFEST_EXT_VERSION {
+                return Err(PersistenceError::Format(format!(
+                    "unsupported segstore manifest extension version {} (expected {})",
+                    m.ext.version, MANIFEST_EXT_VERSION
+                )));
+            }
+            LoadedManifest {
+                epoch,
+                next_seg_id: m.next_seg_id,
+                segment_ids: m.segment_ids,
+                tombstones: m.tombstones.into_iter().collect(),
+                superseded: m
+                    .ext
+                    .superseded
+                    .into_iter()
+                    .map(|(seg, ids)| (seg, ids.into_iter().collect()))
+                    .collect(),
+            }
+        }
+        // The CRC already passed, so a decode failure here is the original
+        // layout ending before the extension. Anything else still fails below.
+        Err(PersistenceError::Decode(_)) => {
+            let (epoch, m): (u64, Manifest<Id>) = ckpt.read_postcard(MANIFEST_PATH)?;
+            LoadedManifest {
+                epoch,
+                next_seg_id: m.next_seg_id,
+                segment_ids: m.segment_ids,
+                tombstones: m.tombstones.into_iter().collect(),
+                superseded: HashMap::new(),
+            }
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(Some(loaded))
+}
+
+/// Whether the copy of `id` sealed in segment `seg` is the live one: `id` is not
+/// tombstoned and that copy was not superseded by a later add.
+fn copy_is_live<Id: Eq + Hash>(
+    tombstones: &HashSet<Id>,
+    superseded: &HashMap<u64, HashSet<Id>>,
+    seg: u64,
+    id: &Id,
+) -> bool {
+    !tombstones.contains(id) && !matches!(superseded.get(&seg), Some(ids) if ids.contains(id))
 }
 
 /// The reader-visible published state: the segments and tombstones as of the last
@@ -911,6 +1035,7 @@ struct PubState<S: Store> {
     segments: Arc<Vec<Arc<S::Segment>>>,
     segment_ids: Arc<Vec<u64>>,
     tombstones: Arc<HashSet<S::Id>>,
+    superseded: Arc<HashMap<u64, HashSet<S::Id>>>,
 }
 
 /// Checkpointed segment metadata without deserializing segment payloads.
@@ -926,6 +1051,7 @@ pub struct SegmentCatalog<Id> {
     next_segment_id: u64,
     segment_ids: Vec<u64>,
     tombstones: HashSet<Id>,
+    superseded: HashMap<u64, HashSet<Id>>,
 }
 
 impl<Id> SegmentCatalog<Id>
@@ -940,25 +1066,20 @@ where
     pub fn open(dir: Arc<dyn Directory>) -> PersistenceResult<Self> {
         reject_legacy_formats(&*dir)?;
 
-        let mut epoch = 0u64;
-        let mut next_segment_id = 0u64;
-        let mut segment_ids = Vec::new();
-        let mut tombstones = HashSet::new();
-        if dir.exists(MANIFEST_PATH) {
-            let ckpt = CheckpointFile::new(dir.clone());
-            let (e, manifest): (u64, Manifest<Id>) = ckpt.read_postcard(MANIFEST_PATH)?;
-            epoch = e;
-            next_segment_id = manifest.next_seg_id;
-            segment_ids = manifest.segment_ids;
-            tombstones = manifest.tombstones.into_iter().collect();
-        }
-
+        let m = read_manifest(&dir)?.unwrap_or_else(|| LoadedManifest {
+            epoch: 0,
+            next_seg_id: 0,
+            segment_ids: Vec::new(),
+            tombstones: HashSet::new(),
+            superseded: HashMap::new(),
+        });
         Ok(Self {
             dir,
-            epoch,
-            next_segment_id,
-            segment_ids,
-            tombstones,
+            epoch: m.epoch,
+            next_segment_id: m.next_seg_id,
+            segment_ids: m.segment_ids,
+            tombstones: m.tombstones,
+            superseded: m.superseded,
         })
     }
 
@@ -988,8 +1109,20 @@ where
     }
 
     /// Whether `id` is not tombstoned in this checkpoint.
+    ///
+    /// This is per-id: when a re-added id has copies in several segments, it is
+    /// true for all of them. Filter a segment's contents with
+    /// [`Self::is_live_in`] instead.
     pub fn is_live(&self, id: &Id) -> bool {
         !self.tombstones.contains(id)
+    }
+
+    /// Whether the copy of `id` in segment `segment_id` is live in this
+    /// checkpoint: `id` is not tombstoned and was not re-added after that
+    /// segment sealed. At most one copy of an id passes this check (see
+    /// [`SegmentedStore::add`]).
+    pub fn is_live_in(&self, segment_id: u64, id: &Id) -> bool {
+        copy_is_live(&self.tombstones, &self.superseded, segment_id, id)
     }
 
     /// The directory backing this catalog.
@@ -1038,7 +1171,7 @@ where
     /// bytes that segstore wrote for that segment. It is a loader/build helper,
     /// not a streaming or mmap-backed query reader. Tombstones are NOT applied:
     /// the payload is the segment as written, including records later deleted;
-    /// filter with [`Self::is_live`] before treating contents as live data.
+    /// filter with [`Self::is_live_in`] before treating contents as live data.
     pub fn read_segment_payload(&self, id: u64) -> PersistenceResult<Vec<u8>> {
         read_checkpoint_payload(&*self.dir, &self.segment_name(id)?)
     }
@@ -1064,7 +1197,7 @@ where
     /// every segment in the manifest. It is still a whole-segment postcard decode,
     /// not a byte-native or mmap-backed query reader. Tombstones are NOT applied:
     /// the decoded segment is as written, including records later deleted;
-    /// filter with [`Self::is_live`] before treating contents as live data.
+    /// filter with [`Self::is_live_in`] before treating contents as live data.
     pub fn read_segment<Segment>(&self, id: u64) -> PersistenceResult<Segment>
     where
         Segment: DeserializeOwned,
@@ -1115,11 +1248,12 @@ pub struct View<S: Store> {
     segments: Arc<Vec<Arc<S::Segment>>>,
     segment_ids: Arc<Vec<u64>>,
     tombstones: Arc<HashSet<S::Id>>,
+    superseded: Arc<HashMap<u64, HashSet<S::Id>>>,
 }
 
 impl<S: Store> View<S> {
     /// The snapshot's immutable segments, oldest first. Query these (each derefs to
-    /// `S::Segment`), filtering with [`Self::is_live`].
+    /// `S::Segment`), filtering each one's copies with [`Self::is_live_in`].
     pub fn segments(&self) -> &[Arc<S::Segment>] {
         &self.segments
     }
@@ -1135,8 +1269,20 @@ impl<S: Store> View<S> {
     }
 
     /// Whether `id` is not tombstoned in this snapshot.
+    ///
+    /// This is per-id: when a re-added id has copies in several segments, it is
+    /// true for all of them. Filter a segment's contents with
+    /// [`Self::is_live_in`] instead.
     pub fn is_live(&self, id: &S::Id) -> bool {
         !self.tombstones.contains(id)
+    }
+
+    /// Whether the copy of `id` in segment `segment_id` (an entry of
+    /// [`Self::segment_ids`]) is live in this snapshot: `id` is not tombstoned
+    /// and was not re-added after that segment sealed. At most one copy of an
+    /// id passes this check (see [`SegmentedStore::add`]).
+    pub fn is_live_in(&self, segment_id: u64, id: &S::Id) -> bool {
+        copy_is_live(&self.tombstones, &self.superseded, segment_id, id)
     }
 
     /// Number of segments in this snapshot.
@@ -1169,6 +1315,7 @@ impl<S: Store> Reader<S> {
             segments: state.segments.clone(),
             segment_ids: state.segment_ids.clone(),
             tombstones: state.tombstones.clone(),
+            superseded: state.superseded.clone(),
         }
     }
 }
@@ -1210,6 +1357,16 @@ pub struct SegmentedStore<S: Store> {
     segments: Vec<Arc<S::Segment>>,
     /// Logically-deleted ids.
     tombstones: HashSet<S::Id>,
+    /// Ids currently in `buffer` (at most one copy each), so a re-add can
+    /// replace its buffered copy without scanning the buffer.
+    buffer_ids: HashSet<S::Id>,
+    /// Per segment id, the ids whose copy there was superseded by a later add
+    /// or delete. Persisted in the manifest so readers can skip stale copies.
+    superseded: HashMap<u64, HashSet<S::Id>>,
+    /// The segment holding each sealed id's live copy, used to mark that copy
+    /// superseded on a re-add or delete. `None` when [`Store::item_ids`] is not
+    /// implemented, which leaves sealed copies untracked.
+    owners: Option<HashMap<S::Id, u64>>,
     /// Published snapshot for concurrent readers (rebuilt on each checkpoint).
     published: Arc<std::sync::RwLock<Arc<PubState<S>>>>,
     wal: RecordLogWriter,
@@ -1286,14 +1443,15 @@ impl<S: Store> SegmentedStore<S> {
         let mut segments: Vec<Arc<S::Segment>> = Vec::new();
         let mut segment_ids: Vec<u64> = Vec::new();
         let mut tombstones: HashSet<S::Id> = HashSet::new();
+        let mut superseded: HashMap<u64, HashSet<S::Id>> = HashMap::new();
         let mut epoch = 0u64;
         let mut next_seg_id = 0u64;
-        if dir.exists(MANIFEST_PATH) {
+        if let Some(manifest) = read_manifest::<S::Id>(&dir)? {
             let ckpt = CheckpointFile::new(dir.clone());
-            let (e, manifest): (u64, Manifest<S::Id>) = ckpt.read_postcard(MANIFEST_PATH)?;
-            epoch = e;
+            epoch = manifest.epoch;
             next_seg_id = manifest.next_seg_id;
-            tombstones = manifest.tombstones.into_iter().collect();
+            tombstones = manifest.tombstones;
+            superseded = manifest.superseded;
             for id in manifest.segment_ids {
                 let (_, seg): (u64, S::Segment) = ckpt.read_postcard(&seg_path(id))?;
                 segments.push(Arc::new(seg));
@@ -1305,29 +1463,36 @@ impl<S: Store> SegmentedStore<S> {
         let published_segments = segments.clone();
         let published_segment_ids = segment_ids.clone();
         let published_tombstones = tombstones.clone();
+        let published_superseded = superseded.clone();
         let persisted_ids: HashSet<u64> = segment_ids.iter().copied().collect();
         let durable = dir.file_path(MANIFEST_PATH).is_some();
 
-        // Replay the current epoch's WAL in full. It holds exactly the ops since
-        // the checkpoint, so every record is applied (no skip offset).
-        let mut buffer: Vec<(S::Id, S::Item)> = Vec::new();
-        let live_wal = wal_path(epoch);
-        if dir.exists(&live_wal) {
-            let reader = RecordLogReader::new(dir.clone(), live_wal.clone());
-            let ops: Vec<Op<S::Id, S::Item>> =
-                reader.read_all_postcard(RecordLogReadMode::BestEffort)?;
-            for op in ops {
-                apply(&mut buffer, &mut tombstones, op);
-                // Reconstruct the same immutable segment boundaries as live writes.
-                // Otherwise a long WAL epoch becomes one oversized buffer on reopen.
-                if !buffer.is_empty() && buffer.len() >= flush_threshold {
-                    let seg = store.build_segment(&buffer);
-                    segments.push(Arc::new(seg));
-                    segment_ids.push(next_seg_id);
-                    next_seg_id += 1;
-                    buffer.clear();
+        // Rebuild which segment holds each id's live copy. A store written before
+        // superseded copies were tracked can hold several live copies of one id;
+        // keep the copy in the newest segment and mark the rest superseded.
+        let mut owners: Option<HashMap<S::Id, u64>> = Some(HashMap::new());
+        for (seg, &seg_id) in segments.iter().zip(&segment_ids) {
+            let (Some(map), Some(ids)) = (owners.as_mut(), store.item_ids(seg)) else {
+                owners = None;
+                break;
+            };
+            for id in ids {
+                if !copy_is_live(&tombstones, &superseded, seg_id, &id) {
+                    continue;
+                }
+                if let Some(older) = map.insert(id.clone(), seg_id) {
+                    superseded.entry(older).or_default().insert(id);
                 }
             }
+        }
+
+        // Read the current epoch's WAL in full. It holds exactly the ops since
+        // the checkpoint, so every record is applied (no skip offset).
+        let live_wal = wal_path(epoch);
+        let mut ops: Vec<Op<S::Id, S::Item>> = Vec::new();
+        if dir.exists(&live_wal) {
+            let reader = RecordLogReader::new(dir.clone(), live_wal.clone());
+            ops = reader.read_all_postcard(RecordLogReadMode::BestEffort)?;
         }
 
         // Best-effort GC of crash leftovers: stale WAL generations (any
@@ -1366,14 +1531,18 @@ impl<S: Store> SegmentedStore<S> {
             segments: Arc::new(published_segments),
             segment_ids: Arc::new(published_segment_ids),
             tombstones: Arc::new(published_tombstones),
+            superseded: Arc::new(published_superseded),
         })));
-        Ok(Self {
+        let mut s = Self {
             store,
             dir,
-            buffer,
+            buffer: Vec::new(),
             segments,
             segment_ids,
             tombstones,
+            buffer_ids: HashSet::new(),
+            superseded,
+            owners,
             wal,
             epoch,
             next_seg_id,
@@ -1384,7 +1553,17 @@ impl<S: Store> SegmentedStore<S> {
             auto_compact,
             published,
             _lock: lock,
-        })
+        };
+        // Replay through the same apply and seal steps as live writes, so a long
+        // WAL epoch reconstructs the same segment boundaries (not one oversized
+        // buffer) and the same superseded copies.
+        for op in ops {
+            s.apply(op);
+            if s.buffer.len() >= s.flush_threshold {
+                s.flush_buffer();
+            }
+        }
+        Ok(s)
     }
 
     /// A cloneable handle for concurrent snapshot reads while this writer mutates.
@@ -1405,16 +1584,27 @@ impl<S: Store> SegmentedStore<S> {
             segments: Arc::new(self.segments.clone()),
             segment_ids: Arc::new(self.segment_ids.clone()),
             tombstones: Arc::new(self.tombstones.clone()),
+            superseded: Arc::new(self.superseded.clone()),
         });
         *self.published.write().unwrap() = state;
     }
 
     /// Add (or re-add) an item. Durably logged before it becomes visible.
+    ///
+    /// A re-add replaces the id's previous value (last write wins), including a
+    /// value deleted earlier. The buffered copy is replaced in place. A copy
+    /// already sealed in a segment stays in that segment's payload until a merge
+    /// drops it, but is marked superseded: [`Self::is_live_in`],
+    /// [`View::is_live_in`], and [`SegmentCatalog::is_live_in`] report it dead,
+    /// so a consumer that filters each segment with them sees only the newest
+    /// copy. Tracking sealed copies needs [`Store::item_ids`] (implemented by
+    /// [`DefaultStore`]); without it only the buffered copy is replaced, and a
+    /// sealed copy stays live next to the new one.
     pub fn add(&mut self, id: S::Id, item: S::Item) -> PersistenceResult<()> {
         self.wal
             .append_postcard(&Op::Add(id.clone(), item.clone()))?;
         self.sync_wal()?;
-        apply(&mut self.buffer, &mut self.tombstones, Op::Add(id, item));
+        self.apply(Op::Add(id, item));
         if self.buffer.len() >= self.flush_threshold {
             self.flush_buffer();
             if self.auto_compact && self.has_eligible_tier() {
@@ -1442,7 +1632,7 @@ impl<S: Store> SegmentedStore<S> {
         for (id, item) in items {
             self.wal
                 .append_postcard(&Op::Add(id.clone(), item.clone()))?;
-            apply(&mut self.buffer, &mut self.tombstones, Op::Add(id, item));
+            self.apply(Op::Add(id, item));
             any = true;
             if self.buffer.len() >= self.flush_threshold {
                 self.flush_buffer();
@@ -1463,8 +1653,42 @@ impl<S: Store> SegmentedStore<S> {
         self.wal
             .append_postcard::<Op<S::Id, S::Item>>(&Op::Delete(id.clone()))?;
         self.sync_wal()?;
-        apply(&mut self.buffer, &mut self.tombstones, Op::Delete(id));
+        self.apply(Op::Delete(id));
         Ok(())
+    }
+
+    /// Apply one operation to the in-memory state. Shared by live writes and WAL
+    /// replay so the two paths cannot diverge.
+    fn apply(&mut self, op: Op<S::Id, S::Item>) {
+        match op {
+            Op::Add(id, item) => {
+                // A re-add revives a previously-deleted id and replaces any older
+                // copy, buffered or sealed.
+                self.tombstones.remove(&id);
+                if self.buffer_ids.contains(&id) {
+                    self.buffer.retain(|(bid, _)| bid != &id);
+                } else {
+                    self.buffer_ids.insert(id.clone());
+                }
+                self.supersede_sealed_copy(&id);
+                self.buffer.push((id, item));
+            }
+            Op::Delete(id) => {
+                if self.buffer_ids.remove(&id) {
+                    self.buffer.retain(|(bid, _)| bid != &id);
+                }
+                // Also mark the sealed copy, so a later re-add cannot revive it.
+                self.supersede_sealed_copy(&id);
+                self.tombstones.insert(id);
+            }
+        }
+    }
+
+    /// Mark `id`'s live sealed copy, if any, as superseded.
+    fn supersede_sealed_copy(&mut self, id: &S::Id) {
+        if let Some(seg) = self.owners.as_mut().and_then(|o| o.remove(id)) {
+            self.superseded.entry(seg).or_default().insert(id.clone());
+        }
     }
 
     /// Make the just-appended WAL record durable per the [`SyncPolicy`].
@@ -1482,9 +1706,20 @@ impl<S: Store> SegmentedStore<S> {
         }
         let seg = self.store.build_segment(&self.buffer);
         let id = self.alloc_id();
+        // `open` probes item_ids on the loaded segments; with none loaded, probe
+        // the first one sealed, before any sealed copy is tracked.
+        if self.segments.is_empty() && self.store.item_ids(&seg).is_none() {
+            self.owners = None;
+        }
+        if let Some(owners) = self.owners.as_mut() {
+            for (item_id, _) in &self.buffer {
+                owners.insert(item_id.clone(), id);
+            }
+        }
         self.segments.push(Arc::new(seg));
         self.segment_ids.push(id);
         self.buffer.clear();
+        self.buffer_ids.clear();
     }
 
     /// Allocate a fresh, never-reused segment id.
@@ -1531,31 +1766,19 @@ impl<S: Store> SegmentedStore<S> {
             segments_before: before,
             ..Default::default()
         };
-        // Nothing to do for 0/1 segments with no tombstones to purge.
-        if before > 1 || (before == 1 && !self.tombstones.is_empty()) {
-            let tombstones = std::mem::take(&mut self.tombstones);
-            // Borrow the Arc-held segments rather than cloning their payloads to
-            // satisfy merge_segments (&[&Segment]); the merge reads them in place.
-            let refs: Vec<&S::Segment> = self.segments.iter().map(|a| &**a).collect();
-            let merged = self
-                .store
-                .merge_segments(&refs, &|id| !tombstones.contains(id));
+        // Nothing to do for 0/1 segments with no dead copies to purge.
+        let has_dead = !self.tombstones.is_empty() || !self.superseded.is_empty();
+        if before > 1 || (before == 1 && has_dead) {
+            // merge_group drops a fully-dead merge result rather than keep an
+            // empty segment.
+            stats.items_merged = self.merge_group((0..before).collect());
             stats.merges = 1;
-            stats.items_merged = self.store.segment_len(&merged);
-            // Drop a fully-tombstoned merge result rather than keep an empty segment.
-            if stats.items_merged > 0 {
-                let id = self.alloc_id();
-                self.segments = vec![Arc::new(merged)];
-                self.segment_ids = vec![id];
-            } else {
-                self.segments = vec![];
-                self.segment_ids = vec![];
-            }
         }
         // After a full compaction no segment references a tombstoned id, so the set
         // is purged even if there was nothing to merge (stale tombstones for ids that
         // were only ever buffered).
         self.tombstones.clear();
+        self.superseded.clear();
         self.checkpoint()?;
         stats.segments_after = self.segments.len();
         Ok(stats)
@@ -1630,12 +1853,37 @@ impl<S: Store> SegmentedStore<S> {
     /// Merge the segments at `indices` into one (dropping tombstoned ids), replacing
     /// them in place with the single result. Returns the merged item count.
     fn merge_group(&mut self, indices: Vec<usize>) -> usize {
+        let group: Vec<u64> = indices.iter().map(|&i| self.segment_ids[i]).collect();
+        // Borrow the Arc-held segments rather than cloning their payloads to
+        // satisfy merge_segments (&[&Segment]); the merge reads them in place.
         let segs: Vec<&S::Segment> = indices.iter().map(|&i| &*self.segments[i]).collect();
         let merged = {
             let tombstones = &self.tombstones;
-            self.store
-                .merge_segments(&segs, &|id| !tombstones.contains(id))
+            let superseded = &self.superseded;
+            if group.iter().any(|g| superseded.contains_key(g)) {
+                // One input can hold a superseded copy of an id whose live copy is
+                // in another input, and an id-only predicate cannot tell the two
+                // apart. Filter each input with its own predicate, then combine.
+                let filtered: Vec<S::Segment> = segs
+                    .iter()
+                    .zip(&group)
+                    .map(|(&seg, &g)| {
+                        self.store.merge_segments(&[seg], &|id| {
+                            copy_is_live(tombstones, superseded, g, id)
+                        })
+                    })
+                    .collect();
+                let refs: Vec<&S::Segment> = filtered.iter().collect();
+                self.store.merge_segments(&refs, &|_| true)
+            } else {
+                self.store
+                    .merge_segments(&segs, &|id| !tombstones.contains(id))
+            }
         };
+        // The merge dropped every superseded copy in the group.
+        for g in &group {
+            self.superseded.remove(g);
+        }
         let n = self.store.segment_len(&merged);
         // Rebuild the segment list in one O(n) pass (filtering the merged indices)
         // instead of k O(n) `Vec::remove` calls, then append the result unless it is
@@ -1659,6 +1907,18 @@ impl<S: Store> SegmentedStore<S> {
             .collect();
         if n > 0 {
             let id = self.alloc_id();
+            if self.owners.is_some() {
+                // Every id in the merge output had its live copy in the group.
+                match self.store.item_ids(&merged) {
+                    Some(ids) => {
+                        let owners = self.owners.get_or_insert_with(HashMap::new);
+                        for item_id in ids {
+                            owners.insert(item_id, id);
+                        }
+                    }
+                    None => self.owners = None,
+                }
+            }
             self.segments.push(Arc::new(merged));
             self.segment_ids.push(id);
         }
@@ -1760,14 +2020,14 @@ impl<S: Store> SegmentedStore<S> {
     pub fn space_amplification(&self) -> Option<f64> {
         let mut stored = 0usize;
         let mut live = 0usize;
-        for seg in &self.segments {
+        for (seg, &seg_id) in self.segments.iter().zip(&self.segment_ids) {
             let l = self
                 .store
-                .live_len(seg, &|id| !self.tombstones.contains(id))?;
+                .live_len(seg, &|id| self.is_live_in(seg_id, id))?;
             stored += self.store.segment_len(seg);
             live += l;
         }
-        // Buffer items are always live (a delete removes from the buffer).
+        // Buffer items are always live (a delete or re-add removes the buffered copy).
         stored += self.buffer.len();
         live += self.buffer.len();
         if live == 0 {
@@ -1792,15 +2052,12 @@ impl<S: Store> SegmentedStore<S> {
             ..Default::default()
         };
         let mut targets = Vec::new();
-        for (i, seg) in self.segments.iter().enumerate() {
+        for (i, (seg, &seg_id)) in self.segments.iter().zip(&self.segment_ids).enumerate() {
             let total = self.store.segment_len(seg);
             if total == 0 {
                 continue;
             }
-            let live = match self
-                .store
-                .live_len(seg, &|id| !self.tombstones.contains(id))
-            {
+            let live = match self.store.live_len(seg, &|id| self.is_live_in(seg_id, id)) {
                 Some(l) => l,
                 None => {
                     // Consumer can't report live counts; reclaim is unavailable.
@@ -1877,11 +2134,23 @@ impl<S: Store> SegmentedStore<S> {
         // 2. Write the manifest: the commit point. It records the new epoch and
         //    names the current segment files, so once it is durable, recovery
         //    replays only the new (initially empty) WAL; the old WAL is superseded.
+        let keep: HashSet<u64> = self.segment_ids.iter().copied().collect();
+        self.superseded.retain(|seg, _| keep.contains(seg));
         let tomb_refs: Vec<&S::Id> = self.tombstones.iter().collect();
+        let mut superseded_refs: Vec<(u64, Vec<&S::Id>)> = self
+            .superseded
+            .iter()
+            .map(|(&seg, ids)| (seg, ids.iter().collect()))
+            .collect();
+        superseded_refs.sort_unstable_by_key(|&(seg, _)| seg);
         let manifest = ManifestRef {
             next_seg_id: self.next_seg_id,
             segment_ids: &self.segment_ids,
             tombstones: &tomb_refs,
+            ext: ManifestExtRef {
+                version: MANIFEST_EXT_VERSION,
+                superseded: &superseded_refs,
+            },
         };
         let manifest_write = if durable {
             ckpt.write_postcard_durable(MANIFEST_PATH, new_epoch, &manifest)
@@ -1897,7 +2166,6 @@ impl<S: Store> SegmentedStore<S> {
 
         // 4. GC the segment files the new manifest no longer names (a merge's
         //    inputs). Safe only now that the manifest is durable.
-        let keep: HashSet<u64> = self.segment_ids.iter().copied().collect();
         self.gc_orphan_segments(&keep, durable, vec![wal_path(old_epoch)]);
 
         // 5. Publish the post-checkpoint segment set to readers (the commit point).
@@ -1906,7 +2174,7 @@ impl<S: Store> SegmentedStore<S> {
     }
 
     /// The immutable segments, oldest first (each derefs to `S::Segment`). Query
-    /// these plus [`Self::buffer`], filtering with [`Self::is_live`]. Segments are
+    /// these plus [`Self::buffer`], filtering segment copies with [`Self::is_live_in`]. Segments are
     /// `Arc`-shared: an unchanged segment keeps its identity across mutations, so a
     /// consumer can cache per-segment state keyed by `Arc::as_ptr` and rebuild only
     /// new segments. For a consistent view while another thread mutates, use a
@@ -1963,8 +2231,31 @@ impl<S: Store> SegmentedStore<S> {
     }
 
     /// Whether `id` is not tombstoned.
+    ///
+    /// This is per-id: when a re-added id has copies in several segments, it is
+    /// true for all of them. Filter a segment's contents with
+    /// [`Self::is_live_in`] instead. Every buffered item is live.
     pub fn is_live(&self, id: &S::Id) -> bool {
         !self.tombstones.contains(id)
+    }
+
+    /// Whether the copy of `id` in segment `segment_id` (an entry of
+    /// [`Self::segment_ids`]) is live: `id` is not tombstoned and was not
+    /// re-added after that segment sealed. At most one copy of an id passes
+    /// this check (see [`Self::add`]).
+    pub fn is_live_in(&self, segment_id: u64, id: &S::Id) -> bool {
+        copy_is_live(&self.tombstones, &self.superseded, segment_id, id)
+    }
+
+    /// The id of the segment holding `id`'s live sealed copy, or `None` if `id`
+    /// is buffered, deleted, absent, or the store does not implement
+    /// [`Store::item_ids`].
+    ///
+    /// A re-add or delete of `id` changes that segment's live set, so a consumer
+    /// that caches a per-segment index can call this first and drop just that
+    /// segment's cache entry, without scanning segments for the id.
+    pub fn live_segment_of(&self, id: &S::Id) -> Option<u64> {
+        self.owners.as_ref()?.get(id).copied()
     }
 
     /// Number of immutable segments.
@@ -1975,26 +2266,6 @@ impl<S: Store> SegmentedStore<S> {
     /// Number of tombstoned ids.
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.len()
-    }
-}
-
-/// Apply one operation to the in-memory buffer + tombstone set. Shared by live
-/// writes and WAL replay so the two paths cannot diverge.
-fn apply<Id: Clone + Eq + Hash, Item>(
-    buffer: &mut Vec<(Id, Item)>,
-    tombstones: &mut HashSet<Id>,
-    op: Op<Id, Item>,
-) {
-    match op {
-        Op::Add(id, item) => {
-            // A re-add revives a previously-deleted id.
-            tombstones.remove(&id);
-            buffer.push((id, item));
-        }
-        Op::Delete(id) => {
-            buffer.retain(|(bid, _)| bid != &id);
-            tombstones.insert(id);
-        }
     }
 }
 
@@ -2093,9 +2364,13 @@ mod tests {
         fn live_len(&self, seg: &Vec<(u32, String)>, live: &dyn Fn(&u32) -> bool) -> Option<usize> {
             Some(seg.iter().filter(|(id, _)| live(id)).count())
         }
+        fn item_ids(&self, seg: &Vec<(u32, String)>) -> Option<Vec<u32>> {
+            Some(seg.iter().map(|(id, _)| *id).collect())
+        }
     }
 
-    /// A store that does NOT implement `live_len` (uses the default `None`).
+    /// A store that does NOT implement `live_len` or `item_ids` (uses the
+    /// default `None`).
     struct OpaqueKv;
     impl Store for OpaqueKv {
         type Id = u32;
@@ -2184,9 +2459,9 @@ mod tests {
     /// Collect the live `(id, item)` set across segments + buffer.
     fn live_set(s: &SegmentedStore<Kv>) -> Vec<(u32, String)> {
         let mut out: Vec<(u32, String)> = Vec::new();
-        for seg in s.segments() {
+        for (seg, &seg_id) in s.segments().iter().zip(s.segment_ids()) {
             for (id, it) in seg.iter() {
-                if s.is_live(id) {
+                if s.is_live_in(seg_id, id) {
                     out.push((*id, it.clone()));
                 }
             }
@@ -2397,37 +2672,167 @@ mod tests {
     }
 
     #[test]
-    fn re_add_of_a_live_id_double_lives_there_is_no_replace() {
-        // Liveness is a per-id boolean, and `add` revives an id (clears its
-        // tombstone), so a re-add of an already-live id does NOT supersede the old
-        // copy: both the old and new values stay live. There is no last-write-wins
-        // and no `replace`; a consumer must use unique ids, or compact away the old
-        // copy before re-adding.
+    fn re_add_of_a_live_id_replaces_the_sealed_copy() {
+        // A re-add supersedes the sealed copy: per-copy liveness keeps only the
+        // newest value, while per-id `is_live` stays true (the id is live).
         let dir = MemoryDirectory::arc();
         let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
         s.add(1, "a".into()).unwrap();
         s.add(2, "x".into()).unwrap(); // flush=2 seals [(1,"a"),(2,"x")]
-        s.add(1, "b".into()).unwrap(); // re-add 1: buffered; segment's (1,"a") survives
-        let n_live_1 = live_set(&s).iter().filter(|(id, _)| *id == 1).count();
-        assert_eq!(
-            n_live_1, 2,
-            "a re-add double-lives the id; no last-write-wins"
-        );
+        s.add(1, "b".into()).unwrap(); // re-add 1: buffered; segment's (1,"a") is superseded
+        assert!(s.is_live(&1));
+        assert!(!s.is_live_in(s.segment_ids()[0], &1));
+        assert_eq!(live_set(&s), vec![(1, "b".into()), (2, "x".into())]);
 
-        // delete-then-add does NOT supersede either: `add` revives (un-tombstones)
-        // the old copy, so it comes back alongside the new value.
+        // delete-then-add does not revive the old copy either.
         s.delete(1).unwrap();
         s.add(1, "c".into()).unwrap();
-        let live_1: Vec<String> = live_set(&s)
-            .into_iter()
-            .filter(|(id, _)| *id == 1)
-            .map(|(_, v)| v)
-            .collect();
-        assert_eq!(
-            live_1,
-            vec!["a".to_string(), "c".to_string()],
-            "delete-then-add revived the old value: no replace in the per-id model"
-        );
+        assert_eq!(live_set(&s), vec![(1, "c".into()), (2, "x".into())]);
+    }
+
+    #[test]
+    fn store_without_item_ids_replaces_only_the_buffered_copy() {
+        // Without Store::item_ids segstore cannot tell which segment holds an
+        // id, so a sealed copy stays live next to a re-add (the pre-tracking
+        // behavior); a buffered copy is still replaced.
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), OpaqueKv, 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "x".into()).unwrap(); // seals [(1,"a"),(2,"x")]
+        s.add(3, "y".into()).unwrap();
+        s.add(3, "z".into()).unwrap(); // buffered re-add
+        assert_eq!(s.buffer(), &[(3, "z".to_string())][..]);
+        s.add(1, "b".into()).unwrap(); // seals [(3,"z"),(1,"b")]
+        let seg0 = s.segment_ids()[0];
+        assert!(s.is_live_in(seg0, &1), "untracked sealed copy stays live");
+        s.checkpoint().unwrap();
+        drop(s);
+        let s = SegmentedStore::open(dir, OpaqueKv, 2).unwrap();
+        assert!(s.is_live_in(seg0, &1), "same after reopen");
+    }
+
+    #[test]
+    fn manifest_without_the_extension_still_opens() {
+        // A manifest in the original layout (no superseded-copy extension), as
+        // written by earlier segstore versions.
+        #[derive(Serialize)]
+        struct OriginalManifest<'a> {
+            next_seg_id: u64,
+            segment_ids: &'a [u64],
+            tombstones: &'a [u32],
+        }
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.checkpoint().unwrap();
+        }
+        let ckpt = CheckpointFile::new(dir.clone());
+        let original = OriginalManifest {
+            next_seg_id: 1,
+            segment_ids: &[0],
+            tombstones: &[2],
+        };
+        ckpt.write_postcard(MANIFEST_PATH, 1, &original).unwrap();
+
+        let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+        assert_eq!(catalog.segment_ids(), &[0]);
+        assert!(catalog.is_live_in(0, &1) && !catalog.is_live_in(0, &2));
+        let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+        assert_eq!(live_set(&s), vec![(1, "a".into())]);
+        // The next checkpoint upgrades it, and a re-add is then tracked.
+        s.add(1, "c".into()).unwrap();
+        s.checkpoint().unwrap();
+        let catalog = SegmentCatalog::<u32>::open(dir).unwrap();
+        assert!(!catalog.is_live_in(0, &1));
+    }
+
+    #[test]
+    fn original_layout_reader_still_decodes_a_current_manifest() {
+        // An older segstore decodes the manifest as `Manifest`; postcard ignores
+        // the trailing extension, so a downgrade still opens (without the
+        // superseded-copy information).
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.add(1, "c".into()).unwrap();
+            s.delete(2).unwrap();
+            s.checkpoint().unwrap();
+        }
+        let ckpt = CheckpointFile::new(dir.clone());
+        let (_, m): (u64, Manifest<u32>) = ckpt.read_postcard(MANIFEST_PATH).unwrap();
+        assert_eq!(m.segment_ids, vec![0, 1]);
+        assert_eq!(m.tombstones, vec![2]);
+        let (_, v2): (u64, ManifestV2<u32>) = ckpt.read_postcard(MANIFEST_PATH).unwrap();
+        assert_eq!(v2.ext.version, MANIFEST_EXT_VERSION);
+        let mut superseded = v2.ext.superseded;
+        for (_, ids) in &mut superseded {
+            ids.sort_unstable();
+        }
+        assert_eq!(superseded, vec![(0, vec![1, 2])]);
+    }
+
+    #[test]
+    fn open_keeps_the_newest_copy_when_an_old_manifest_has_duplicates() {
+        // Before superseded copies were tracked, a re-add left two live copies
+        // in sealed segments. Opening such a store keeps the newest one.
+        #[derive(Serialize)]
+        struct OriginalManifest<'a> {
+            next_seg_id: u64,
+            segment_ids: &'a [u64],
+            tombstones: &'a [u32],
+        }
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "x".into()).unwrap();
+            s.add(1, "b".into()).unwrap();
+            s.add(3, "y".into()).unwrap();
+            s.checkpoint().unwrap();
+        }
+        let original = OriginalManifest {
+            next_seg_id: 2,
+            segment_ids: &[0, 1],
+            tombstones: &[],
+        };
+        CheckpointFile::new(dir.clone())
+            .write_postcard(MANIFEST_PATH, 1, &original)
+            .unwrap();
+        let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+        let want = vec![(1, "b".into()), (2, "x".into()), (3, "y".into())];
+        assert_eq!(live_set(&s), want);
+        s.compact().unwrap();
+        assert_eq!(s.stored_len(), 3, "compaction dropped the older copy");
+        assert_eq!(live_set(&s), want);
+    }
+
+    #[test]
+    fn unknown_manifest_extension_version_is_rejected() {
+        #[derive(Serialize)]
+        struct FutureManifest<'a> {
+            next_seg_id: u64,
+            segment_ids: &'a [u64],
+            tombstones: &'a [u32],
+            version: u32,
+            superseded: &'a [(u64, Vec<u32>)],
+        }
+        let dir = MemoryDirectory::arc();
+        let ckpt = CheckpointFile::new(dir.clone());
+        let future = FutureManifest {
+            next_seg_id: 0,
+            segment_ids: &[],
+            tombstones: &[],
+            version: MANIFEST_EXT_VERSION + 1,
+            superseded: &[],
+        };
+        ckpt.write_postcard(MANIFEST_PATH, 0, &future).unwrap();
+        let err = SegmentCatalog::<u32>::open(dir.clone()).err().unwrap();
+        assert!(err.to_string().contains("extension version"), "{err}");
+        assert!(SegmentedStore::open(dir, Kv, 2).is_err());
     }
 
     #[test]
@@ -2806,10 +3211,9 @@ mod tests {
             ..Default::default()
         };
         let mut s = SegmentedStore::open_with_options(dir, Kv, tier_opts(3, cfg, true)).unwrap();
-        // Unique ids per add (segstore makes no dedup promise; identity is the
-        // Store impl's job, and the toy Kv appends duplicates on re-add). A
-        // monotonic id keeps the reference model exact while still exercising
-        // insert/delete/merge invariants.
+        // Unique ids per add. A monotonic id keeps the reference model exact
+        // while still exercising insert/delete/merge invariants; re-adds are
+        // covered by `re_adds_are_last_write_wins_under_random_ops`.
         let mut expect: std::collections::BTreeMap<u32, String> = Default::default();
         let mut live_ids: Vec<u32> = Vec::new();
         let mut next_id = 0u32;
@@ -4224,9 +4628,9 @@ mod tests {
     use proptest::prelude::*;
 
     /// An op applied to both the store and a reference model. `Add` uses a fresh
-    /// unique id (segstore makes no dedup promise, and compaction reorders
-    /// segments, so re-adds of one id have no last-write-wins guarantee); `Delete`
-    /// targets the k-th currently-live id.
+    /// unique id (re-adds are covered by
+    /// `re_adds_are_last_write_wins_under_random_ops`); `Delete` targets the k-th
+    /// currently-live id.
     #[derive(Debug, Clone)]
     enum SimOp {
         Add,
@@ -4442,6 +4846,321 @@ mod tests {
                 SegmentCatalog::<u32>::open(dir).is_err(),
                 "corrupt manifest byte {i} was accepted"
             );
+        }
+    }
+
+    // ---- re-add replaces: the newest copy of an id wins everywhere ----
+
+    type Dkv = DefaultStore<u32, String>;
+
+    // The per-copy liveness check a consumer applies while scanning one sealed
+    // segment: tombstoned ids AND copies superseded by a newer add are dead.
+    fn writer_copy_live(s: &SegmentedStore<Dkv>, seg: u64, id: &u32) -> bool {
+        s.is_live_in(seg, id)
+    }
+    fn view_copy_live(v: &View<Dkv>, seg: u64, id: &u32) -> bool {
+        v.is_live_in(seg, id)
+    }
+    fn catalog_copy_live(c: &SegmentCatalog<u32>, seg: u64, id: &u32) -> bool {
+        c.is_live_in(seg, id)
+    }
+
+    /// Every live (id, value) a consumer sees through the writer: sealed
+    /// segments filtered per copy, plus the buffer.
+    fn writer_latest(s: &SegmentedStore<Dkv>) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        for (seg, &seg_id) in s.segments().iter().zip(s.segment_ids()) {
+            for (id, v) in seg.iter() {
+                if writer_copy_live(s, seg_id, id) {
+                    out.push((*id, v.clone()));
+                }
+            }
+        }
+        for (id, v) in s.buffer() {
+            if s.is_live(id) {
+                out.push((*id, v.clone()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn view_latest(v: &View<Dkv>) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        for (seg, &seg_id) in v.segments().iter().zip(v.segment_ids()) {
+            for (id, val) in seg.iter() {
+                if view_copy_live(v, seg_id, id) {
+                    out.push((*id, val.clone()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn catalog_latest(dir: Arc<dyn Directory>) -> Vec<(u32, String)> {
+        let c = SegmentCatalog::<u32>::open(dir).unwrap();
+        let mut out = Vec::new();
+        for &seg_id in c.segment_ids() {
+            let seg: Vec<(u32, String)> = c.read_segment(seg_id).unwrap();
+            for (id, val) in seg {
+                if catalog_copy_live(&c, seg_id, &id) {
+                    out.push((id, val));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn kv(pairs: &[(u32, &str)]) -> Vec<(u32, String)> {
+        pairs.iter().map(|&(id, v)| (id, v.to_string())).collect()
+    }
+
+    /// Seal [(1,a),(2,x)], then re-add 1 and seal [(1,b),(3,y)].
+    fn re_add_across_segments(dir: Arc<dyn Directory>) -> SegmentedStore<Dkv> {
+        let mut s = SegmentedStore::open(dir, Dkv::new(), 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "x".into()).unwrap();
+        s.add(1, "b".into()).unwrap();
+        s.add(3, "y".into()).unwrap();
+        assert_eq!(s.segment_count(), 2, "both batches sealed");
+        s
+    }
+
+    #[test]
+    fn re_add_after_flush_replaces_the_sealed_copy_in_a_view() {
+        let dir = MemoryDirectory::arc();
+        let mut s = re_add_across_segments(dir);
+        let want = kv(&[(1, "b"), (2, "x"), (3, "y")]);
+        assert_eq!(writer_latest(&s), want, "writer sees only the newest copy");
+        s.checkpoint().unwrap();
+        assert_eq!(view_latest(&s.reader().view()), want, "view too");
+    }
+
+    #[test]
+    fn live_segment_of_names_the_segment_a_re_add_will_supersede() {
+        let dir = MemoryDirectory::arc();
+        let mut s = re_add_across_segments(dir);
+        let (seg0, seg1) = (s.segment_ids()[0], s.segment_ids()[1]);
+        assert_eq!(s.live_segment_of(&1), Some(seg1));
+        assert_eq!(s.live_segment_of(&2), Some(seg0));
+        s.add(2, "q".into()).unwrap();
+        assert_eq!(s.live_segment_of(&2), None, "buffered");
+        assert!(!s.is_live_in(seg0, &2));
+        s.delete(3).unwrap();
+        assert_eq!(s.live_segment_of(&3), None, "deleted");
+        assert_eq!(s.live_segment_of(&9), None, "absent");
+        s.compact().unwrap();
+        let merged = s.segment_ids()[0];
+        assert_eq!(s.live_segment_of(&1), Some(merged));
+        assert_eq!(s.live_segment_of(&2), Some(merged));
+        let s = SegmentedStore::open(MemoryDirectory::arc(), OpaqueKv, 1).unwrap();
+        assert_eq!(s.live_segment_of(&1), None, "untracked store");
+    }
+
+    #[test]
+    fn re_add_within_the_buffer_keeps_one_copy() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Dkv::new(), 100).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(1, "b".into()).unwrap();
+        assert_eq!(s.buffer(), &kv(&[(1, "b")])[..]);
+    }
+
+    #[test]
+    fn re_add_survives_checkpoint_and_reopen() {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = re_add_across_segments(dir.clone());
+            s.checkpoint().unwrap();
+        }
+        let want = kv(&[(1, "b"), (2, "x"), (3, "y")]);
+        assert_eq!(catalog_latest(dir.clone()), want, "manifest-only reader");
+        let s = SegmentedStore::open(dir, Dkv::new(), 2).unwrap();
+        assert_eq!(writer_latest(&s), want, "reopened writer");
+        assert_eq!(view_latest(&s.reader().view()), want, "reopened view");
+    }
+
+    #[test]
+    fn re_add_survives_wal_only_reopen() {
+        let dir = MemoryDirectory::arc();
+        {
+            let mut s = SegmentedStore::open(dir.clone(), Dkv::new(), 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "x".into()).unwrap();
+            s.checkpoint().unwrap(); // (1,a) is in a persisted segment
+            s.add(1, "b".into()).unwrap(); // the re-add lives only in the WAL
+        }
+        let mut s = SegmentedStore::open(dir.clone(), Dkv::new(), 2).unwrap();
+        assert_eq!(writer_latest(&s), kv(&[(1, "b"), (2, "x")]));
+        // Replay that seals the re-add into a segment behaves the same.
+        s.add(3, "y".into()).unwrap();
+        drop(s);
+        let mut s = SegmentedStore::open(dir.clone(), Dkv::new(), 2).unwrap();
+        let want = kv(&[(1, "b"), (2, "x"), (3, "y")]);
+        assert_eq!(writer_latest(&s), want);
+        s.checkpoint().unwrap();
+        assert_eq!(view_latest(&s.reader().view()), want);
+        assert_eq!(catalog_latest(dir), want);
+    }
+
+    #[test]
+    fn delete_after_re_add_removes_every_copy_and_a_later_add_does_not_revive_them() {
+        let dir = MemoryDirectory::arc();
+        let mut s = re_add_across_segments(dir.clone());
+        s.delete(1).unwrap();
+        assert_eq!(writer_latest(&s), kv(&[(2, "x"), (3, "y")]));
+        s.checkpoint().unwrap();
+        // Re-adding after the delete must not bring back (1,a) or (1,b).
+        s.add(1, "c".into()).unwrap();
+        s.add(4, "z".into()).unwrap();
+        let want = kv(&[(1, "c"), (2, "x"), (3, "y"), (4, "z")]);
+        assert_eq!(writer_latest(&s), want);
+        s.checkpoint().unwrap();
+        assert_eq!(view_latest(&s.reader().view()), want);
+        assert_eq!(catalog_latest(dir.clone()), want);
+        drop(s);
+        let s = SegmentedStore::open(dir, Dkv::new(), 2).unwrap();
+        assert_eq!(writer_latest(&s), want);
+    }
+
+    #[test]
+    fn full_compaction_keeps_only_the_newest_copy() {
+        let dir = MemoryDirectory::arc();
+        let mut s = re_add_across_segments(dir.clone());
+        s.compact().unwrap();
+        assert_eq!(s.segment_count(), 1);
+        let mut physical: Vec<(u32, String)> = s.segments()[0].as_ref().clone();
+        physical.sort();
+        assert_eq!(physical, kv(&[(1, "b"), (2, "x"), (3, "y")]));
+    }
+
+    #[test]
+    fn partial_merge_keeps_only_the_newest_copy() {
+        let dir = MemoryDirectory::arc();
+        let mut s = re_add_across_segments(dir.clone());
+        s.add(4, "z".into()).unwrap();
+        s.add(5, "w".into()).unwrap(); // third segment, left out of the merge below
+                                       // Merge the two smallest-first segments: the old and the new copy of 1.
+        s.force_merge_to(2).unwrap();
+        assert_eq!(s.segment_count(), 2);
+        let all: Vec<(u32, String)> = s
+            .segments()
+            .iter()
+            .flat_map(|g| g.iter().cloned())
+            .collect();
+        let copies_of_1 = all.iter().filter(|(id, _)| *id == 1).count();
+        assert_eq!(
+            copies_of_1, 1,
+            "merged output dropped the stale copy: {all:?}"
+        );
+        let want = kv(&[(1, "b"), (2, "x"), (3, "y"), (4, "z"), (5, "w")]);
+        assert_eq!(writer_latest(&s), want);
+        drop(s);
+        let s = SegmentedStore::open(dir, Dkv::new(), 2).unwrap();
+        assert_eq!(writer_latest(&s), want);
+    }
+
+    #[test]
+    fn merge_that_skips_the_newest_copy_drops_the_stale_one() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir.clone(), Dkv::new(), 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "x".into()).unwrap(); // seg 0: stale (1,a)
+        s.add(3, "y".into()).unwrap();
+        s.add(4, "z".into()).unwrap(); // seg 1
+        s.add(1, "b".into()).unwrap();
+        s.add(5, "w".into()).unwrap(); // seg 2: newest (1,b)
+        s.add(6, "v".into()).unwrap();
+        s.add(7, "u".into()).unwrap();
+        s.add(8, "t".into()).unwrap(); // seg 3, plus (8,t) sealed by the checkpoint
+        s.checkpoint().unwrap();
+        // Merge seg 0 with seg 1 only: the merged output (a NEWER segment id than
+        // seg 2) must not carry the stale (1,a) forward.
+        let merged = s.merge_group(vec![0, 1]);
+        assert_eq!(merged, 3);
+        s.checkpoint().unwrap();
+        let want = kv(&[
+            (1, "b"),
+            (2, "x"),
+            (3, "y"),
+            (4, "z"),
+            (5, "w"),
+            (6, "v"),
+            (7, "u"),
+            (8, "t"),
+        ]);
+        assert_eq!(writer_latest(&s), want);
+        assert_eq!(catalog_latest(dir.clone()), want);
+        drop(s);
+        let s = SegmentedStore::open(dir, Dkv::new(), 2).unwrap();
+        assert_eq!(writer_latest(&s), want);
+    }
+
+    #[test]
+    fn reclaim_counts_superseded_copies_as_dead() {
+        let dir = MemoryDirectory::arc();
+        let mut s = SegmentedStore::open(dir, Dkv::new(), 2).unwrap();
+        s.add(1, "a".into()).unwrap();
+        s.add(2, "x".into()).unwrap();
+        s.add(1, "b".into()).unwrap();
+        s.add(2, "y".into()).unwrap(); // both copies in seg 0 are now stale
+        let amp = s.space_amplification().unwrap();
+        assert!((amp - 2.0).abs() < 1e-9, "4 stored / 2 live, got {amp}");
+        s.reclaim_tombstones(0.5).unwrap();
+        assert_eq!(s.stored_len(), 2, "the dead segment was rewritten away");
+        assert_eq!(writer_latest(&s), kv(&[(1, "b"), (2, "y")]));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        /// Last-write-wins under random re-adds, deletes, checkpoints, merges, and
+        /// reopens: writer, view, and catalog all agree with a map model.
+        #[test]
+        fn re_adds_are_last_write_wins_under_random_ops(
+            ops in proptest::collection::vec((0u8..6, 0u32..12), 0..160)
+        ) {
+            let dir = MemoryDirectory::arc();
+            let cfg = TierConfig { min_merge: 2, max_merge: 4, max_merged_len: 64, ..Default::default() };
+            let mk = || Options { tiering: cfg, ..Options::new(3) };
+            let mut s = SegmentedStore::open_with_options(dir.clone(), Dkv::new(), mk()).unwrap();
+            let mut model: std::collections::BTreeMap<u32, String> = Default::default();
+            let mut committed = model.clone();
+            for (step, (op, id)) in ops.into_iter().enumerate() {
+                match op {
+                    0 | 1 => {
+                        let v = format!("v{step}");
+                        s.add(id, v.clone()).unwrap();
+                        model.insert(id, v);
+                    }
+                    2 => {
+                        s.delete(id).unwrap();
+                        model.remove(&id);
+                    }
+                    3 => {
+                        s.checkpoint().unwrap();
+                        committed = model.clone();
+                    }
+                    4 => {
+                        if id % 2 == 0 {
+                            s.compact().unwrap();
+                        } else {
+                            s.compact_tiers().unwrap();
+                        }
+                        s.checkpoint().unwrap();
+                        committed = model.clone();
+                    }
+                    _ => {
+                        s = SegmentedStore::open_with_options(dir.clone(), Dkv::new(), mk()).unwrap();
+                    }
+                }
+                let want: Vec<(u32, String)> = model.clone().into_iter().collect();
+                prop_assert_eq!(writer_latest(&s), want);
+                let want_committed: Vec<(u32, String)> = committed.clone().into_iter().collect();
+                prop_assert_eq!(view_latest(&s.reader().view()), want_committed.clone());
+                prop_assert_eq!(catalog_latest(dir.clone()), want_committed);
+            }
         }
     }
 }

@@ -31,8 +31,13 @@ assert!(s.is_live(&1) && !s.is_live(&2));
 ```
 
 Use `DefaultStore<Id, Item>` when a segment is just `Vec<(Id, Item)>`. Implement
-`Store` directly when a consumer needs sorted segments, replacement semantics, or
-a custom merge.
+`Store` directly when a consumer needs sorted segments or a custom merge.
+
+A re-add replaces the id's previous value. A copy already sealed in a segment is
+marked superseded rather than rewritten, so filter each segment's items with
+`is_live_in(segment_id, &id)` (on the writer, a `View`, or a `SegmentCatalog`);
+`is_live(&id)` only says the id is not deleted. Custom stores get this by
+implementing `Store::item_ids`.
 
 ## Durability
 
@@ -70,7 +75,7 @@ segment's validated serialized payload bytes into an owned or caller-reused
 buffer, or decode one requested segment for sidecar rebuilds. It is still a
 catalog helper for loaders and diagnostics, not a byte-native query reader.
 The catalog boundary is precise: segment bytes are the source payload as written,
-and tombstones are exposed separately through `is_live`. Consumers that decode or
+and liveness is exposed separately through `is_live_in`. Consumers that decode or
 map segment bytes must apply liveness and their own query metadata; segstore does
 not convert source payloads into a live query view. Consumers that mmap or
 range-read bytes from `SegmentPayloadInfo` should call

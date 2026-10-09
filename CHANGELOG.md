@@ -7,6 +7,28 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Changed
+
+- A re-add now replaces the id's previous value (last write wins). Before, a
+  re-add of an id whose copy was already sealed left both copies live, and a
+  delete followed by an add revived the deleted copy. The buffered copy is
+  replaced in place; a sealed copy is marked superseded and dropped by the next
+  merge that includes its segment.
+- The manifest gains a versioned extension recording superseded copies.
+  Manifests without it still open; older segstore versions ignore it.
+
+### Added
+
+- `is_live_in(segment_id, &id)` on `SegmentedStore`, `View`, and
+  `SegmentCatalog`: per-copy liveness. Use it instead of `is_live` when
+  filtering a segment's items.
+- `SegmentedStore::live_segment_of(&id)`: the segment holding an id's live
+  sealed copy, so a consumer can invalidate one cached per-segment index before
+  a re-add or delete instead of scanning segments.
+- `Store::item_ids`, a provided method (default `None`) that lists a segment's
+  ids. `DefaultStore` implements it. A store that does not keeps the previous
+  behavior for sealed copies.
+
 ## [0.5.0] - 2026-07-09
 
 ### Added

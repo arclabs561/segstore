@@ -10,6 +10,7 @@ repository = "https://github.com/arclabs561/segstore"
 documentation = "https://docs.rs/segstore"
 keywords = ["lsm", "wal", "segments", "index", "persistence"]
 categories = ["data-structures", "database-implementations"]
+include = ["/src", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
 
 [workspace]
 

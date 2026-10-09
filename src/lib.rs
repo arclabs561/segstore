@@ -115,6 +115,9 @@ const LEGACY_CKPT_PATH: &str = "segstore.ckpt";
 /// The 0.3 checkpoint commit point: a small manifest naming the current segment
 /// files + tombstones (see the module-level Durability docs).
 const MANIFEST_PATH: &str = "segstore.manifest";
+
+/// Advisory lock file held exclusively for a store's lifetime.
+const LOCK_PATH: &str = "segstore.lock";
 /// Prefix for per-segment files (`segstore.seg.<id>`); each holds one immutable
 /// segment, written once and never rewritten.
 const SEG_PREFIX: &str = "segstore.seg.";
@@ -1170,6 +1173,33 @@ impl<S: Store> Reader<S> {
     }
 }
 
+/// Take the store's exclusive advisory lock (flock / LockFileEx).
+///
+/// The kernel drops it when the process exits, so a crash never leaves a
+/// stale lock behind.
+fn acquire_store_lock(dir: &dyn Directory) -> PersistenceResult<Option<std::fs::File>> {
+    let Some(path) = dir.file_path(LOCK_PATH) else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    use fs4::fs_std::FileExt;
+    // fs4 reports contention as `Ok(false)`, not as an error.
+    if !file.try_lock_exclusive()? {
+        return Err(PersistenceError::LockFailed {
+            resource: path.display().to_string(),
+            reason: "another SegmentedStore holds this directory".into(),
+        });
+    }
+    Ok(Some(file))
+}
+
 /// A generic, durable, segmented mutable store.
 pub struct SegmentedStore<S: Store> {
     store: S,
@@ -1204,6 +1234,9 @@ pub struct SegmentedStore<S: Store> {
     /// Ids whose `segstore.seg.<id>` file is durably on disk, so a checkpoint can
     /// skip rewriting an unchanged segment.
     persisted_ids: HashSet<u64>,
+    /// Exclusive lock on `segstore.lock`, held until drop. `None` for backends
+    /// without a filesystem path, which cannot be shared across processes.
+    _lock: Option<std::fs::File>,
 }
 
 impl<S: Store> SegmentedStore<S> {
@@ -1242,6 +1275,10 @@ impl<S: Store> SegmentedStore<S> {
             ));
         }
         reject_legacy_formats(&*dir)?;
+        // A second writer would checkpoint and GC this writer's WAL epoch,
+        // silently dropping acknowledged writes, so take the lock before
+        // reading any state.
+        let lock = acquire_store_lock(&*dir)?;
 
         // Load the manifest if one exists. It records the WAL epoch it covers (in
         // the CheckpointFile header) and names the current segment files; recovery
@@ -1346,6 +1383,7 @@ impl<S: Store> SegmentedStore<S> {
             tiering,
             auto_compact,
             published,
+            _lock: lock,
         })
     }
 
@@ -2454,6 +2492,22 @@ mod tests {
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (3, "c".into())]);
         assert!(!s2.is_live(&2));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_writer_on_one_directory_is_refused() {
+        // Two writers on one directory each checkpoint and GC the other's WAL
+        // epoch, silently losing acknowledged adds. The store must take an
+        // exclusive lock for its lifetime and release it on drop.
+        let root = temp_root("single-writer");
+        let first = SegmentedStore::open(durability::FsDirectory::arc(&root).unwrap(), Kv, 2)
+            .expect("first open");
+        let second = SegmentedStore::open(durability::FsDirectory::arc(&root).unwrap(), Kv, 2);
+        assert!(second.is_err(), "a second live writer must be refused");
+        drop(first);
+        SegmentedStore::open(durability::FsDirectory::arc(&root).unwrap(), Kv, 2)
+            .expect("the lock is released when the first store drops");
         let _ = std::fs::remove_dir_all(&root);
     }
 

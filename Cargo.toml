@@ -16,6 +16,7 @@ categories = ["data-structures", "database-implementations"]
 [dependencies]
 crc32fast = "1"
 durability = "0.7.2"
+fs4 = "0.13"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

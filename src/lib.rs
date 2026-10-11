@@ -107,6 +107,9 @@ use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter}
 use durability::{Directory, PersistenceError, PersistenceResult};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+#[cfg(feature = "conformance")]
+pub mod conformance;
+
 /// Prefix for epoch-suffixed WAL files (`segstore.wal.<epoch>`).
 const WAL_PREFIX: &str = "segstore.wal.";
 /// The single unsuffixed WAL of the 0.1 on-disk format; its presence flags a

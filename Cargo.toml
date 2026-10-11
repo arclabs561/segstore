@@ -1,6 +1,6 @@
 [package]
 name = "segstore"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -19,6 +19,11 @@ crc32fast = "1"
 durability = "0.8"
 fs4 = "0.13"
 serde = { version = "1", features = ["derive"] }
+
+[features]
+# Shared behaviour tests for indexes built on SegmentedStore; enable it from a
+# store crate's dev-dependencies and call `conformance::run_all`.
+conformance = []
 
 [dev-dependencies]
 proptest = "1"

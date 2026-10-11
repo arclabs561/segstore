@@ -7,6 +7,18 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-10
+
+### Added
+
+- `conformance` feature: `segstore::conformance::run_all` checks an index built
+  on `SegmentedStore` through a small `ConformanceStore` trait. It runs seeded
+  random add, re-add, delete, compact, checkpoint and reopen sequences against
+  a map, and checks re-add replacement, delete, reopen without checkpoint, and
+  that a second writer is refused. Meant for a store crate's
+  `[dev-dependencies]`. It fails on a store that keeps serving a re-added id's
+  old copy or that skips the writer lock.
+
 ## [0.6.0] - 2026-10-09
 
 ### Changed

@@ -7,6 +7,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-12
+
 ### Changed
 
 - Updated `durability` to 0.9. Public `Directory` and persistence error types
@@ -262,3 +264,6 @@ unstable: minor bumps may break the public API and the on-disk format.
 Initial release: the `Store` trait, `SegmentedStore` with a write-ahead log,
 immutable segments, tombstone deletes, checkpoint snapshots, full compaction, and
 crash recovery, on top of `durability`.
+
+[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/arclabs561/segstore/compare/v0.6.1...v0.7.0

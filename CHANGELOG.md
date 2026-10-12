@@ -7,6 +7,15 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-12
+
+### Fixed
+
+- Reader views immediately after recovery use reconstructed checkpoint ownership,
+  so legacy copies across different segments expose only the newest value before
+  another checkpoint. Uncheckpointed WAL replacements remain invisible to readers
+  until checkpoint, and already-held views remain unchanged.
+
 ## [0.7.1] - 2026-10-12
 
 ### Fixed
@@ -278,5 +287,7 @@ Initial release: the `Store` trait, `SegmentedStore` with a write-ahead log,
 immutable segments, tombstone deletes, checkpoint snapshots, full compaction, and
 crash recovery, on top of `durability`.
 
-[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/arclabs561/segstore/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/arclabs561/segstore/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/arclabs561/segstore/compare/v0.6.1...v0.7.0

@@ -1481,7 +1481,6 @@ impl<S: Store> SegmentedStore<S> {
         let published_segments = segments.clone();
         let published_segment_ids = segment_ids.clone();
         let published_tombstones = tombstones.clone();
-        let published_superseded = superseded.clone();
         let persisted_ids: HashSet<u64> = segment_ids.iter().copied().collect();
         let durable = dir.file_path(MANIFEST_PATH).is_some();
 
@@ -1508,6 +1507,10 @@ impl<S: Store> SegmentedStore<S> {
                 }
             }
         }
+
+        // Legacy checkpoint ownership is now reconstructed. Publish that state,
+        // before WAL replay can supersede copies with uncheckpointed replacements.
+        let published_superseded = superseded.clone();
 
         // Read the current epoch's WAL in full. It holds exactly the ops since
         // the checkpoint, so every record is applied (no skip offset).
@@ -2969,6 +2972,60 @@ mod tests {
         s.compact().unwrap();
         assert_eq!(s.stored_len(), 3, "compaction dropped the older copy");
         assert_eq!(live_set(&s), want);
+    }
+
+    #[test]
+    fn recovered_reader_uses_checkpoint_ownership_before_wal_replay() {
+        // The original manifest layout is also exercised by the legacy writer
+        // recovery tests above. Reader visibility must include its reconstructed
+        // owners, but exclude replacements that only exist in the WAL.
+        #[derive(Serialize)]
+        struct OriginalManifest<'a> {
+            next_seg_id: u64,
+            segment_ids: &'a [u64],
+            tombstones: &'a [u32],
+        }
+        for legacy in [true, false] {
+            for wal_replacement in [false, true] {
+                let dir = MemoryDirectory::arc();
+                let mut s = SegmentedStore::open(dir.clone(), Dkv::new(), 1).unwrap();
+                s.add(1, "old".into()).unwrap();
+                s.add(1, "checkpoint".into()).unwrap();
+                s.checkpoint().unwrap();
+                if legacy {
+                    CheckpointFile::new(dir.clone())
+                        .write_postcard(
+                            MANIFEST_PATH,
+                            1,
+                            &OriginalManifest {
+                                next_seg_id: 2,
+                                segment_ids: &[0, 1],
+                                tombstones: &[],
+                            },
+                        )
+                        .unwrap();
+                }
+                if wal_replacement {
+                    s.add(1, "wal".into()).unwrap();
+                }
+                drop(s);
+
+                let mut s = SegmentedStore::open(dir, Dkv::new(), 1).unwrap();
+                let reader = s.reader();
+                let held = reader.view();
+                let checkpoint = vec![(1, "checkpoint".into())];
+                assert_eq!(view_latest(&held), checkpoint);
+                let current = if wal_replacement {
+                    vec![(1, "wal".into())]
+                } else {
+                    checkpoint.clone()
+                };
+                assert_eq!(writer_latest(&s), current);
+                s.checkpoint().unwrap();
+                assert_eq!(view_latest(&reader.view()), current);
+                assert_eq!(view_latest(&held), checkpoint, "held view is immutable");
+            }
+        }
     }
 
     #[test]

@@ -2960,7 +2960,6 @@ mod tests {
     /// next reopen. Appending them behind the torn bytes made every later open
     /// fail with a CRC mismatch, so the whole store became unopenable.
     #[test]
-    #[ignore = "needs durability > 0.7.2, which repairs the record log tail before appending"]
     fn writes_after_torn_tail_recovery_survive_reopen() {
         let root = temp_root("torn-wal-then-write");
         {

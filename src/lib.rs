@@ -967,6 +967,7 @@ struct ManifestExtRef<'a, Id> {
 
 /// A decoded manifest of either layout.
 struct LoadedManifest<Id> {
+    has_ownership_metadata: bool,
     epoch: u64,
     next_seg_id: u64,
     segment_ids: Vec<u64>,
@@ -992,6 +993,7 @@ where
                 )));
             }
             LoadedManifest {
+                has_ownership_metadata: true,
                 epoch,
                 next_seg_id: m.next_seg_id,
                 segment_ids: m.segment_ids,
@@ -1009,6 +1011,7 @@ where
         Err(PersistenceError::Decode(_)) => {
             let (epoch, m): (u64, Manifest<Id>) = ckpt.read_postcard(MANIFEST_PATH)?;
             LoadedManifest {
+                has_ownership_metadata: false,
                 epoch,
                 next_seg_id: m.next_seg_id,
                 segment_ids: m.segment_ids,
@@ -1066,16 +1069,28 @@ where
     /// Visibility matches [`Reader::view`]: this reflects only the most recent
     /// checkpoint. WAL suffix records after that checkpoint are not exposed
     /// because they have not been sealed into immutable segment files.
+    ///
+    /// Returns a format error for a nonempty legacy manifest without per-copy
+    /// ownership metadata. Catalog access cannot resolve duplicate copies without
+    /// reading segment payloads. Writer recovery and checkpoint can upgrade
+    /// duplicates across segments, but duplicate live ids within one segment
+    /// require rebuilding from validated records instead.
     pub fn open(dir: Arc<dyn Directory>) -> PersistenceResult<Self> {
         reject_legacy_formats(&*dir)?;
 
         let m = read_manifest(&dir)?.unwrap_or_else(|| LoadedManifest {
+            has_ownership_metadata: true,
             epoch: 0,
             next_seg_id: 0,
             segment_ids: Vec::new(),
             tombstones: HashSet::new(),
             superseded: HashMap::new(),
         });
+        if !m.has_ownership_metadata && !m.segment_ids.is_empty() {
+            return Err(PersistenceError::Format(
+                "legacy manifest lacks per-copy ownership metadata; read-only catalog access requires explicit migration or rebuilding from validated records".into(),
+            ));
+        }
         Ok(Self {
             dir,
             epoch: m.epoch,
@@ -1484,6 +1499,11 @@ impl<S: Store> SegmentedStore<S> {
                     continue;
                 }
                 if let Some(older) = map.insert(id.clone(), seg_id) {
+                    if older == seg_id {
+                        return Err(PersistenceError::Format(format!(
+                            "duplicate live id in the same segment {seg_id}; automatic recovery is unsafe; restore a known-good generation or rebuild from validated latest-per-id records"
+                        )));
+                    }
                     superseded.entry(older).or_default().insert(id);
                 }
             }
@@ -2714,6 +2734,143 @@ mod tests {
         assert!(s.is_live_in(seg0, &1), "same after reopen");
     }
 
+    #[derive(Serialize)]
+    struct LegacyTestManifest {
+        next_seg_id: u64,
+        segment_ids: Vec<u64>,
+        tombstones: Vec<u32>,
+    }
+
+    #[test]
+    fn writer_rejects_duplicate_live_ids_within_one_segment_without_changes() {
+        let dir = MemoryDirectory::arc();
+        let ckpt = CheckpointFile::new(dir.clone());
+        ckpt.write_postcard(
+            "segstore.seg.0",
+            0,
+            &vec![(7u32, "old".to_string()), (7, "new".to_string())],
+        )
+        .unwrap();
+        let manifest = LegacyTestManifest {
+            next_seg_id: 1,
+            segment_ids: vec![0],
+            tombstones: vec![],
+        };
+        ckpt.write_postcard(MANIFEST_PATH, 0, &manifest).unwrap();
+        let snapshot = || {
+            let mut names = dir.list_dir("").unwrap();
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut bytes = Vec::new();
+                    dir.open_file(&name)
+                        .unwrap()
+                        .read_to_end(&mut bytes)
+                        .unwrap();
+                    (name, bytes)
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let error = match SegmentedStore::open(dir.clone(), DefaultStore::<u32, String>::new(), 2) {
+            Ok(_) => panic!("duplicate live ids within a segment cannot be safely reconstructed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, PersistenceError::Format(_)), "{error}");
+        assert!(error.to_string().contains("same segment"), "{error}");
+        assert_eq!(snapshot(), before);
+    }
+
+    #[test]
+    fn legacy_catalog_rejects_nonempty_manifest_without_reading_segments() {
+        for segment_ids in [vec![0], vec![0, 1]] {
+            let dir = MemoryDirectory::arc();
+            let manifest = LegacyTestManifest {
+                next_seg_id: segment_ids.len() as u64,
+                segment_ids,
+                tombstones: vec![],
+            };
+            CheckpointFile::new(dir.clone())
+                .write_postcard(MANIFEST_PATH, 1, &manifest)
+                .unwrap();
+            let before = {
+                let mut bytes = Vec::new();
+                dir.open_file(MANIFEST_PATH)
+                    .unwrap()
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                bytes
+            };
+            let error = match SegmentCatalog::<u32>::open(dir.clone()) {
+                Ok(_) => panic!("nonempty legacy ownership is ambiguous"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, PersistenceError::Format(_)), "{error}");
+            assert!(error.to_string().contains("ownership"), "{error}");
+            assert_eq!(
+                {
+                    let mut bytes = Vec::new();
+                    dir.open_file(MANIFEST_PATH)
+                        .unwrap()
+                        .read_to_end(&mut bytes)
+                        .unwrap();
+                    bytes
+                },
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_catalog_allows_empty_and_modern_empty_ownership_metadata() {
+        let dir = MemoryDirectory::arc();
+        assert_eq!(
+            SegmentCatalog::<u32>::open(dir.clone())
+                .unwrap()
+                .segment_count(),
+            0
+        );
+        let empty = LegacyTestManifest {
+            next_seg_id: 0,
+            segment_ids: vec![],
+            tombstones: vec![],
+        };
+        let ckpt = CheckpointFile::new(dir.clone());
+        ckpt.write_postcard(MANIFEST_PATH, 0, &empty).unwrap();
+        assert_eq!(
+            SegmentCatalog::<u32>::open(dir.clone())
+                .unwrap()
+                .segment_count(),
+            0
+        );
+        let modern = ManifestRef {
+            next_seg_id: 2,
+            segment_ids: &[0, 1],
+            tombstones: &[],
+            ext: ManifestExtRef::<u32> {
+                version: MANIFEST_EXT_VERSION,
+                superseded: &[],
+            },
+        };
+        ckpt.write_postcard(MANIFEST_PATH, 1, &modern).unwrap();
+        // There are deliberately no segment payload files: catalog open stays manifest-only.
+        let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
+        assert_eq!(catalog.segment_count(), 2);
+        assert!(catalog.is_live_in(0, &7));
+        let single = ManifestRef {
+            next_seg_id: 1,
+            segment_ids: &[0],
+            tombstones: &[],
+            ext: ManifestExtRef::<u32> {
+                version: MANIFEST_EXT_VERSION,
+                superseded: &[],
+            },
+        };
+        ckpt.write_postcard(MANIFEST_PATH, 1, &single).unwrap();
+        assert_eq!(SegmentCatalog::<u32>::open(dir).unwrap().segment_count(), 1);
+    }
+
     #[test]
     fn manifest_without_the_extension_still_opens() {
         // A manifest in the original layout (no superseded-copy extension), as
@@ -2739,9 +2896,10 @@ mod tests {
         };
         ckpt.write_postcard(MANIFEST_PATH, 1, &original).unwrap();
 
-        let catalog = SegmentCatalog::<u32>::open(dir.clone()).unwrap();
-        assert_eq!(catalog.segment_ids(), &[0]);
-        assert!(catalog.is_live_in(0, &1) && !catalog.is_live_in(0, &2));
+        assert!(matches!(
+            SegmentCatalog::<u32>::open(dir.clone()),
+            Err(PersistenceError::Format(_))
+        ));
         let mut s = SegmentedStore::open(dir.clone(), Kv, 2).unwrap();
         assert_eq!(live_set(&s), vec![(1, "a".into())]);
         // The next checkpoint upgrades it, and a re-add is then tracked.

@@ -7,6 +7,19 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-12
+
+### Fixed
+
+- `SegmentCatalog::open` rejects nonempty legacy manifests without per-copy
+  ownership metadata instead of exposing potentially obsolete copies. Empty
+  legacy stores and modern manifests remain readable without segment payload IO.
+- Writer recovery rejects duplicate live IDs within one segment before changing
+  checkpoint or WAL data, instead of marking all copies superseded. Duplicate
+  copies across different segments still recover to the newest segment; a
+  checkpoint then upgrades their catalog metadata. Same-segment duplicates need
+  a known-good generation or a rebuild from validated latest-per-ID records.
+
 ## [0.7.0] - 2026-10-12
 
 ### Changed

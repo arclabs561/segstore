@@ -7,6 +7,23 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-12
+
+### Changed
+
+- Updated `durability` to 0.9. Public `Directory` and persistence error types
+  now come from that version; callers and conformance adapters must align their
+  direct durability dependency to 0.9.
+- Adopted durability's WAL recovery fix: `WalWriter::resume` preserves the
+  file and returns an error when a damaged length is followed by a valid empty
+  v3 frame. Legacy v2 empty-payload CRC handling is unchanged.
+
+### Fixed
+
+- Enabled the existing filesystem regression for writes acknowledged after
+  torn-tail recovery surviving the next reopen; its old dependency-related
+  ignore is no longer needed.
+
 ## [0.6.1] - 2026-10-10
 
 ### Added
@@ -247,3 +264,6 @@ unstable: minor bumps may break the public API and the on-disk format.
 Initial release: the `Store` trait, `SegmentedStore` with a write-ahead log,
 immutable segments, tombstone deletes, checkpoint snapshots, full compaction, and
 crash recovery, on top of `durability`.
+
+[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/arclabs561/segstore/compare/v0.6.1...v0.7.0

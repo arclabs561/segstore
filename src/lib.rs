@@ -4719,10 +4719,48 @@ mod tests {
         )
     }
 
+    #[test]
+    fn full_compaction_can_exceed_tier_cap_and_stays_frozen_after_reopen() {
+        for count in [64u32, 65, 66] {
+            let dir = MemoryDirectory::arc();
+            let cfg = TierConfig {
+                min_merge: 4,
+                max_merge: 8,
+                max_merged_len: 64,
+                ..Default::default()
+            };
+            let options = || Options {
+                tiering: cfg,
+                ..Options::new(3)
+            };
+            let mut s = SegmentedStore::open_with_options(dir.clone(), Kv, options()).unwrap();
+            let expected: Vec<_> = (0..count).map(|id| (id, format!("v{id}"))).collect();
+            for (id, value) in &expected {
+                s.add(*id, value.clone()).unwrap();
+            }
+            s.compact().unwrap();
+            assert_eq!(s.segment_sizes(), vec![count as usize]);
+            assert_eq!(live_set(&s), expected);
+            let frozen_id = s.segment_ids()[0];
+            assert_eq!(s.compact_tiers().unwrap().merges, 0);
+            assert_eq!(s.segment_ids(), &[frozen_id]);
+            assert_eq!(live_set(&s), expected);
+            drop(s);
+            let mut s = SegmentedStore::open_with_options(dir, Kv, options()).unwrap();
+            assert_eq!(s.segment_sizes(), vec![count as usize]);
+            assert_eq!(s.segment_ids(), &[frozen_id]);
+            assert_eq!(live_set(&s), expected);
+            assert_eq!(s.compact_tiers().unwrap().merges, 0);
+            assert_eq!(s.segment_ids(), &[frozen_id]);
+            assert_eq!(live_set(&s), expected);
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
         /// For any sequence of add/delete/compact/compact_tiers/reopen, the live set
-        /// equals the reference model and every segment stays within the cap.
+        /// equals the reference model. Only full compaction may create over-cap
+        /// segments; other operations may retain those frozen segments without growing them.
         #[test]
         fn live_set_matches_reference_under_random_ops(
             ops in proptest::collection::vec(op_strategy(), 0..200)
@@ -4740,6 +4778,10 @@ mod tests {
             let mut live_ids: Vec<u32> = Vec::new();
             let mut next_id = 0u32;
             for op in ops {
+                let oversized: std::collections::BTreeMap<_, _> = s.segment_ids().iter()
+                    .copied().zip(s.segment_sizes())
+                    .filter(|&(_, size)| size > cfg.max_merged_len).collect();
+                let full_compaction = matches!(op, SimOp::Compact);
                 match op {
                     SimOp::Add => {
                         let id = next_id;
@@ -4766,8 +4808,11 @@ mod tests {
                         s = SegmentedStore::open_with_options(dir.clone(), Kv, mk()).unwrap();
                     }
                 }
-                for sz in s.segment_sizes() {
-                    prop_assert!(sz <= cfg.max_merged_len);
+                if !full_compaction {
+                    for (&id, size) in s.segment_ids().iter().zip(s.segment_sizes()) {
+                        prop_assert!(size <= cfg.max_merged_len
+                            || oversized.get(&id).is_some_and(|&before| size <= before));
+                    }
                 }
                 // segment_ids must stay aligned 1:1 with segments under every op,
                 // including across Reopen (the persist-index cache key invariant).

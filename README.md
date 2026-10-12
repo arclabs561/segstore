@@ -13,7 +13,8 @@ any other updatable structure.
 
 ```toml
 [dependencies]
-segstore = "0.5"
+segstore = "0.7"
+durability = "0.9"
 ```
 
 ## Example
@@ -64,8 +65,8 @@ sidecars across restarts.
 For corpora larger than memory, segstore is not yet a complete out-of-core
 reader. The next layer needs a reader/open path that can expose stable segment
 ids and segment file handles (or mmap-backed consumer readers) without
-deserializing each payload. `durability` already provides filesystem paths and an
-optional mmap helper; the missing piece is a segstore API that keeps the
+deserializing each payload. `durability` provides filesystem paths;
+the missing piece is a segstore API that keeps the
 manifest/GC/checkpoint guarantees while letting consumers stream or map their own
 segment formats.
 

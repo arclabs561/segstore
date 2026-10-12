@@ -82,6 +82,13 @@ not convert source payloads into a live query view. Consumers that mmap or
 range-read bytes from `SegmentPayloadInfo` should call
 `SegmentPayloadInfo::verify_payload` before trusting those bytes.
 
+Nonempty legacy manifests without per-copy ownership metadata are rejected by
+`SegmentCatalog::open`. Writer recovery followed by checkpoint can upgrade
+stores whose duplicate IDs occur in different segments. Repeated live IDs within
+one segment are rejected during recovery; use a known-good generation or rebuild
+from validated latest-per-ID records in that case. Empty legacy stores remain
+readable. Catalog open never scans segment payloads to resolve this ambiguity.
+
 For byte-native query paths, use consumer sidecars. `segstore` reserves and
 garbage-collects `segstore.idx.<segment-id>.<kind>` next to the source segment,
 but the consumer owns the sidecar format and compatibility checks. A postings

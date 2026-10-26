@@ -1409,6 +1409,10 @@ pub struct SegmentedStore<S: Store> {
     /// Ids whose `segstore.seg.<id>` file is durably on disk, so a checkpoint can
     /// skip rewriting an unchanged segment.
     persisted_ids: HashSet<u64>,
+    /// Set when a manifest write fails. The new manifest may already be visible,
+    /// and reopen would then GC the current WAL generation, so later writes are
+    /// refused rather than acknowledged into a log that recovery deletes.
+    poisoned: bool,
     /// Exclusive lock on `segstore.lock`, held until drop. `None` for backends
     /// without a filesystem path, which cannot be shared across processes.
     _lock: Option<std::fs::File>,
@@ -1578,6 +1582,7 @@ impl<S: Store> SegmentedStore<S> {
             tiering,
             auto_compact,
             published,
+            poisoned: false,
             _lock: lock,
         };
         // Replay through the same apply and seal steps as live writes, so a long
@@ -1627,6 +1632,7 @@ impl<S: Store> SegmentedStore<S> {
     /// [`DefaultStore`]); without it only the buffered copy is replaced, and a
     /// sealed copy stays live next to the new one.
     pub fn add(&mut self, id: S::Id, item: S::Item) -> PersistenceResult<()> {
+        self.check_poisoned()?;
         self.wal
             .append_postcard(&Op::Add(id.clone(), item.clone()))?;
         self.sync_wal()?;
@@ -1654,6 +1660,7 @@ impl<S: Store> SegmentedStore<S> {
         &mut self,
         items: impl IntoIterator<Item = (S::Id, S::Item)>,
     ) -> PersistenceResult<()> {
+        self.check_poisoned()?;
         let mut any = false;
         for (id, item) in items {
             self.wal
@@ -1676,6 +1683,7 @@ impl<S: Store> SegmentedStore<S> {
 
     /// Tombstone an item. Durably logged before it takes effect.
     pub fn delete(&mut self, id: S::Id) -> PersistenceResult<()> {
+        self.check_poisoned()?;
         self.wal
             .append_postcard::<Op<S::Id, S::Item>>(&Op::Delete(id.clone()))?;
         self.sync_wal()?;
@@ -1715,6 +1723,15 @@ impl<S: Store> SegmentedStore<S> {
         if let Some(seg) = self.owners.as_mut().and_then(|o| o.remove(id)) {
             self.superseded.entry(seg).or_default().insert(id.clone());
         }
+    }
+
+    fn check_poisoned(&self) -> PersistenceResult<()> {
+        if self.poisoned {
+            return Err(PersistenceError::InvalidState(
+                "store is poisoned after a failed manifest write; reopen to recover".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Make the just-appended WAL record durable per the [`SyncPolicy`].
@@ -2126,7 +2143,12 @@ impl<S: Store> SegmentedStore<S> {
     /// WAL is superseded. A crash after the checkpoint but before the old WAL is
     /// deleted is safe: recovery never reads the old epoch, and the stale file is
     /// GC'd on the next open.
+    ///
+    /// If the manifest write fails, the new manifest may already be visible, so
+    /// the store is poisoned: later writes and checkpoints return `InvalidState`.
+    /// Reopen the store to recover.
     pub fn checkpoint(&mut self) -> PersistenceResult<()> {
+        self.check_poisoned()?;
         self.flush_buffer();
         debug_assert_eq!(self.segments.len(), self.segment_ids.len());
         let new_epoch = self.epoch + 1;
@@ -2183,7 +2205,10 @@ impl<S: Store> SegmentedStore<S> {
         } else {
             ckpt.write_postcard(MANIFEST_PATH, new_epoch, &manifest)
         };
-        manifest_write.map_err(|e| size_cap_context(e, "manifest (segment ids + tombstones)"))?;
+        if let Err(e) = manifest_write {
+            self.poisoned = true;
+            return Err(size_cap_context(e, "manifest (segment ids + tombstones)"));
+        }
 
         // 3. Past the commit point: start the new WAL generation and drop the old.
         let old_epoch = self.epoch;
@@ -4138,6 +4163,103 @@ mod tests {
         assert!(
             matches!(err, Err(PersistenceError::InvalidConfig(_))),
             "legacy monolithic checkpoints are rejected consistently"
+        );
+    }
+
+    /// A `Directory` whose manifest write, once armed, publishes the new manifest
+    /// and then fails, like a durable write whose fsync fails after the rename.
+    struct ManifestPublishedThenFailsDir {
+        inner: Arc<dyn Directory>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    impl Directory for ManifestPublishedThenFailsDir {
+        fn create_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.inner.create_file(p)
+        }
+        fn open_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
+            self.inner.open_file(p)
+        }
+        fn exists(&self, p: &str) -> bool {
+            self.inner.exists(p)
+        }
+        fn delete(&self, p: &str) -> PersistenceResult<()> {
+            self.inner.delete(p)
+        }
+        fn atomic_rename(&self, a: &str, b: &str) -> PersistenceResult<()> {
+            self.inner.atomic_rename(a, b)
+        }
+        fn create_dir_all(&self, p: &str) -> PersistenceResult<()> {
+            self.inner.create_dir_all(p)
+        }
+        fn list_dir(&self, p: &str) -> PersistenceResult<Vec<String>> {
+            self.inner.list_dir(p)
+        }
+        fn append_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.inner.append_file(p)
+        }
+        fn atomic_write(&self, p: &str, d: &[u8]) -> PersistenceResult<()> {
+            self.inner.atomic_write(p, d)?;
+            if p == MANIFEST_PATH && self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(PersistenceError::InvalidState(
+                    "injected fault after manifest publish".into(),
+                ));
+            }
+            Ok(())
+        }
+        fn file_path(&self, p: &str) -> Option<std::path::PathBuf> {
+            self.inner.file_path(p)
+        }
+    }
+
+    #[test]
+    fn failed_manifest_write_refuses_later_writes_instead_of_losing_them() {
+        let mem = MemoryDirectory::arc();
+        let faulty = Arc::new(ManifestPublishedThenFailsDir {
+            inner: mem.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut s = SegmentedStore::open(faulty.clone(), Kv, 100).unwrap();
+        let mut acked = Vec::new();
+        s.add(1, "v1".into()).unwrap();
+        acked.push(1u32);
+        s.checkpoint().unwrap();
+        s.add(2, "v2".into()).unwrap();
+        acked.push(2);
+
+        faulty
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(s.checkpoint().is_err(), "injected manifest fault surfaces");
+        faulty
+            .armed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // The new manifest is visible, so reopen GCs the store's current WAL
+        // generation. A write appended there must be refused, not acknowledged.
+        let after_add = s.add(3, "v3".into());
+        if after_add.is_ok() {
+            acked.push(3);
+        }
+        let after_delete = s.delete(1);
+        if after_delete.is_ok() {
+            acked.retain(|&id| id != 1);
+        }
+
+        // Reopen as a crash would (memory backends take no process lock).
+        let s2 = SegmentedStore::open(mem, Kv, 100).unwrap();
+        let live: Vec<u32> = live_set(&s2).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(live, acked, "every acknowledged write survives reopen");
+        assert!(
+            after_add.is_err(),
+            "add after a failed checkpoint is refused"
+        );
+        assert!(
+            after_delete.is_err(),
+            "delete after a failed checkpoint is refused"
+        );
+        assert!(
+            s.checkpoint().is_err(),
+            "a poisoned store refuses checkpoint"
         );
     }
 

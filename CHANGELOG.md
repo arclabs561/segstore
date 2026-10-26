@@ -7,6 +7,15 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Fixed
+
+- A checkpoint whose manifest write fails now poisons the store: later `add`,
+  `extend`, `delete`, and `checkpoint` calls return `InvalidState`. The durable
+  manifest write can fail after the new manifest is already visible; reopen then
+  deletes the WAL generation the store was still appending to, which silently
+  lost writes acknowledged after the failed checkpoint. Reopen the store to
+  recover.
+
 ## [0.7.2] - 2026-10-12
 
 ### Fixed

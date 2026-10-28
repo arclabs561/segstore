@@ -12,7 +12,7 @@ captured from release runs.
 | Persist a built per-segment index sidecar | `persist_index` |
 | Persist byte-native postings sidecars | `postings_sidecar` |
 
-## Index Shapes
+## Index shapes
 
 ### `inverted_index`: can `Store` model an updatable inverted index?
 
@@ -49,12 +49,12 @@ indexed 4 vectors across 2 segments
 The example brute-force scans each segment for clarity. A real consumer would
 put an ANN graph inside each segment and merge per-segment top-k results.
 
-## Persistence Hook
+## Persistence hook
 
 ### `persist_index`: can a consumer cache built per-segment indices?
 
 Builds a toy sorted sidecar for each segment, writes it under segstore's
-reserved index-sidecar name, opens the manifest catalog, then loads the sidecars
+reserved name for index sidecars, opens the manifest catalog, then loads the sidecars
 instead of rebuilding them. A missing or stale sidecar decodes only that segment.
 
 ```bash
@@ -77,7 +77,7 @@ lets expensive built indices survive restarts.
 
 Builds a `postings::raw` segment for each immutable segstore segment and writes
 it under the reserved sidecar name. Reopen goes through `SegmentCatalog`, loads
-the raw sidecars, and filters tombstoned docs with the catalog liveness set.
+the raw sidecars, and filters tombstoned docs with the catalog's liveness set.
 
 ```bash
 cargo run --release --example postings_sidecar

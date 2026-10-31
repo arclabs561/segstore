@@ -15,6 +15,13 @@ unstable: minor bumps may break the public API and the on-disk format.
   deletes the WAL generation the store was still appending to, which silently
   lost writes acknowledged after the failed checkpoint. Reopen the store to
   recover.
+- A merge whose output cannot be written (a segment over the 256 MiB per-blob
+  cap, or an IO error) now fails `compact`, `compact_tiers`, `force_merge_to`,
+  or `reclaim_tombstones` and leaves the segment set unchanged. Before, the
+  unwritable merged segment stayed in memory, so every later `checkpoint`
+  failed on it: readers stopped advancing and the WAL grew until reopen. The
+  merged segment file is now written before the merge is applied in memory;
+  no on-disk format change.
 
 ## [0.7.2] - 2026-10-12
 

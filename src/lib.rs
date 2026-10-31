@@ -505,7 +505,11 @@ pub struct TierConfig {
     /// This is an item count, but each segment is persisted as one checkpoint blob
     /// bounded by [`MAX_CHECKPOINT_PAYLOAD_BYTES`] (256 MiB). The two caps are in
     /// different units: keep `max_merged_len * (your serialized bytes per item)` under
-    /// that byte cap, or a large merge will fail the checkpoint write. There is no
+    /// that byte cap, or a large merge fails: the compaction returns the size-cap
+    /// error and leaves the segment set unchanged, and later checkpoints proceed.
+    /// The default (10 million items) is far above the byte cap for most payloads;
+    /// dense `f32` vectors of dimension `d` take about `4 * d` bytes per item, so
+    /// a 768-dimensional store reaches 256 MiB near 87,000 items. There is no
     /// byte-aware merge planning yet (see the size-cap discussion in the crate docs).
     pub max_merged_len: usize,
 }
@@ -1814,7 +1818,7 @@ impl<S: Store> SegmentedStore<S> {
         if before > 1 || (before == 1 && has_dead) {
             // merge_group drops a fully-dead merge result rather than keep an
             // empty segment.
-            stats.items_merged = self.merge_group((0..before).collect());
+            stats.items_merged = self.merge_group((0..before).collect())?;
             stats.merges = 1;
         }
         // After a full compaction no segment references a tombstoned id, so the set
@@ -1846,7 +1850,7 @@ impl<S: Store> SegmentedStore<S> {
             ..Default::default()
         };
         while let Some(group) = self.next_merge_group() {
-            stats.items_merged += self.merge_group(group);
+            stats.items_merged += self.merge_group(group)?;
             stats.merges += 1;
         }
         if stats.merges > 0 {
@@ -1883,7 +1887,7 @@ impl<S: Store> SegmentedStore<S> {
                 .min(self.tiering.max_merge.max(2))
                 .min(self.segments.len());
             let group: Vec<usize> = idx.into_iter().take(k).collect();
-            stats.items_merged += self.merge_group(group);
+            stats.items_merged += self.merge_group(group)?;
             stats.merges += 1;
         }
         if stats.merges > 0 {
@@ -1895,7 +1899,14 @@ impl<S: Store> SegmentedStore<S> {
 
     /// Merge the segments at `indices` into one (dropping tombstoned ids), replacing
     /// them in place with the single result. Returns the merged item count.
-    fn merge_group(&mut self, indices: Vec<usize>) -> usize {
+    ///
+    /// The merged segment file is written before any in-memory state changes, so
+    /// a refused write (an output over the per-blob byte cap, or an IO error)
+    /// leaves the store exactly as it was. Otherwise the unpersistable result
+    /// would sit in the segment list and fail every later checkpoint. Until a
+    /// manifest names it, the file is an orphan that the next open or checkpoint
+    /// garbage-collects.
+    fn merge_group(&mut self, indices: Vec<usize>) -> PersistenceResult<usize> {
         let group: Vec<u64> = indices.iter().map(|&i| self.segment_ids[i]).collect();
         // Borrow the Arc-held segments rather than cloning their payloads to
         // satisfy merge_segments (&[&Segment]); the merge reads them in place.
@@ -1923,11 +1934,18 @@ impl<S: Store> SegmentedStore<S> {
                     .merge_segments(&segs, &|id| !tombstones.contains(id))
             }
         };
+        let n = self.store.segment_len(&merged);
+        let merged_id = if n > 0 {
+            let id = self.alloc_id();
+            self.persist_segment(id, &merged)?;
+            Some(id)
+        } else {
+            None
+        };
         // The merge dropped every superseded copy in the group.
         for g in &group {
             self.superseded.remove(g);
         }
-        let n = self.store.segment_len(&merged);
         // Rebuild the segment list in one O(n) pass (filtering the merged indices)
         // instead of k O(n) `Vec::remove` calls, then append the result unless it is
         // empty (a fully-tombstoned group leaves no segment behind).
@@ -1948,8 +1966,7 @@ impl<S: Store> SegmentedStore<S> {
             .filter(|(i, _)| merged_idx.binary_search(i).is_err())
             .map(|(_, id)| id)
             .collect();
-        if n > 0 {
-            let id = self.alloc_id();
+        if let Some(id) = merged_id {
             if self.owners.is_some() {
                 // Every id in the merge output had its live copy in the group.
                 match self.store.item_ids(&merged) {
@@ -1965,7 +1982,22 @@ impl<S: Store> SegmentedStore<S> {
             self.segments.push(Arc::new(merged));
             self.segment_ids.push(id);
         }
-        n
+        Ok(n)
+    }
+
+    /// Write segment `id` to its `segstore.seg.<id>` file (durably on a filesystem
+    /// backend) and record it as persisted, so a checkpoint does not rewrite it.
+    fn persist_segment(&mut self, id: u64, seg: &S::Segment) -> PersistenceResult<()> {
+        let durable = self.dir.file_path(MANIFEST_PATH).is_some();
+        let ckpt = CheckpointFile::new(self.dir.clone());
+        let seg_write = if durable {
+            ckpt.write_postcard_durable(&seg_path(id), 0, seg)
+        } else {
+            ckpt.write_postcard(&seg_path(id), 0, seg)
+        };
+        seg_write.map_err(|e| size_cap_context(e, &format!("segment {id}")))?;
+        self.persisted_ids.insert(id);
+        Ok(())
     }
 
     /// Whether at least one size bucket is eligible to merge right now.
@@ -2117,7 +2149,7 @@ impl<S: Store> SegmentedStore<S> {
             return Ok(stats);
         }
         // Even a single tombstone-heavy segment is worth rewriting to drop dead data.
-        stats.items_merged += self.merge_group(targets);
+        stats.items_merged += self.merge_group(targets)?;
         stats.merges = 1;
         self.checkpoint()?;
         stats.segments_after = self.segments.len();
@@ -2169,14 +2201,8 @@ impl<S: Store> SegmentedStore<S> {
             .map(|(i, &id)| (i, id))
             .collect();
         for (idx, id) in to_write {
-            let seg = &*self.segments[idx];
-            let seg_write = if durable {
-                ckpt.write_postcard_durable(&seg_path(id), 0, seg)
-            } else {
-                ckpt.write_postcard(&seg_path(id), 0, seg)
-            };
-            seg_write.map_err(|e| size_cap_context(e, &format!("segment {id}")))?;
-            self.persisted_ids.insert(id);
+            let seg = Arc::clone(&self.segments[idx]);
+            self.persist_segment(id, &seg)?;
         }
 
         // 2. Write the manifest: the commit point. It records the new epoch and
@@ -4263,6 +4289,103 @@ mod tests {
         );
     }
 
+    /// A `Directory` that refuses segment files above `cap` bytes, as the
+    /// checkpoint payload cap refuses an oversized segment, deterministically
+    /// on every attempt.
+    struct SegmentSizeCapDir {
+        inner: Arc<dyn Directory>,
+        cap: usize,
+    }
+    impl Directory for SegmentSizeCapDir {
+        fn create_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.inner.create_file(p)
+        }
+        fn open_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
+            self.inner.open_file(p)
+        }
+        fn exists(&self, p: &str) -> bool {
+            self.inner.exists(p)
+        }
+        fn delete(&self, p: &str) -> PersistenceResult<()> {
+            self.inner.delete(p)
+        }
+        fn atomic_rename(&self, a: &str, b: &str) -> PersistenceResult<()> {
+            self.inner.atomic_rename(a, b)
+        }
+        fn create_dir_all(&self, p: &str) -> PersistenceResult<()> {
+            self.inner.create_dir_all(p)
+        }
+        fn list_dir(&self, p: &str) -> PersistenceResult<Vec<String>> {
+            self.inner.list_dir(p)
+        }
+        fn append_file(&self, p: &str) -> PersistenceResult<Box<dyn std::io::Write + Send>> {
+            self.inner.append_file(p)
+        }
+        fn atomic_write(&self, p: &str, d: &[u8]) -> PersistenceResult<()> {
+            if p.starts_with(SEG_PREFIX) && d.len() > self.cap {
+                return Err(PersistenceError::Format(format!(
+                    "injected size cap: {} bytes",
+                    d.len()
+                )));
+            }
+            self.inner.atomic_write(p, d)
+        }
+        fn file_path(&self, p: &str) -> Option<std::path::PathBuf> {
+            self.inner.file_path(p)
+        }
+    }
+
+    #[test]
+    fn oversized_merge_fails_compaction_without_blocking_later_checkpoints() {
+        let mem = MemoryDirectory::arc();
+        let capped: Arc<dyn Directory> = Arc::new(SegmentSizeCapDir {
+            inner: mem.clone(),
+            cap: 600,
+        });
+        let mut s = SegmentedStore::open(capped, Kv, 2).unwrap();
+        let item = |id: u32| format!("{id:0>100}");
+        // Four two-item segments of about 200 bytes each: one size tier whose
+        // merged output (about 800 bytes) exceeds the cap.
+        for id in 0..8u32 {
+            s.add(id, item(id)).unwrap();
+        }
+        s.checkpoint().unwrap();
+        assert_eq!(s.segment_count(), 4);
+        assert!(s.has_eligible_tier());
+        let before = live_set(&s);
+
+        assert!(
+            s.compact_tiers().is_err(),
+            "the oversized merge output is refused"
+        );
+        assert_eq!(
+            s.segment_count(),
+            4,
+            "a refused merge leaves the segment set unchanged"
+        );
+        assert_eq!(live_set(&s), before);
+
+        // The store keeps committing: a later checkpoint persists new writes
+        // and publishes them to readers instead of retrying the refused merge.
+        s.add(100, "after".into()).unwrap();
+        s.checkpoint()
+            .expect("checkpoint after a refused merge succeeds");
+        let view = s.reader().view();
+        assert!(
+            view.segments()
+                .iter()
+                .any(|seg| seg.iter().any(|(id, _)| *id == 100)),
+            "readers see writes committed after the refused merge"
+        );
+
+        drop(s);
+        let s2 = SegmentedStore::open(mem, Kv, 2).unwrap();
+        let mut expected = before;
+        expected.push((100, "after".into()));
+        expected.sort();
+        assert_eq!(live_set(&s2), expected, "reopen recovers every write");
+    }
+
     #[test]
     fn recovers_consistently_from_io_fault_at_every_step() {
         // FoundationDB-style fault injection: fail the Nth IO op, then reopen on
@@ -5497,7 +5620,7 @@ mod tests {
         s.checkpoint().unwrap();
         // Merge seg 0 with seg 1 only: the merged output (a NEWER segment id than
         // seg 2) must not carry the stale (1,a) forward.
-        let merged = s.merge_group(vec![0, 1]);
+        let merged = s.merge_group(vec![0, 1]).unwrap();
         assert_eq!(merged, 3);
         s.checkpoint().unwrap();
         let want = kv(&[

@@ -1164,7 +1164,7 @@ where
     /// The returned file is the current segstore segment file, including its
     /// durability checkpoint envelope. This method intentionally does not decode
     /// `Store::Segment`; consumers that need byte-native segments need the raw
-    /// segment API described in `docs/design/out-of-core-segment-reader.md`.
+    /// segment API described in `docs/out-of-core-segment-reader.md`.
     pub fn open_segment_file(&self, id: u64) -> PersistenceResult<Box<dyn std::io::Read + Send>> {
         self.dir.open_file(&self.segment_name(id)?)
     }

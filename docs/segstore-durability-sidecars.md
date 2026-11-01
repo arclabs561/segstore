@@ -192,6 +192,22 @@ pattern is real, but the variation is still semantically important. A shared
 trait becomes useful only after at least two consumers converge on the same
 header mechanics while keeping their recipe descriptors separate.
 
+### Amendment 2026-11-01: accepted
+
+The condition above is met, and the trait is accepted. The implementation is
+`segstore::sidecar` (`LiveIds`, `SidecarKey`, `SidecarCodec`, `SidecarHost`,
+`SidecarCache`); the recipe descriptor stays with each consumer — magic, version,
+kind, recipe id, byte encoding and the live-id acceptance check are the codec's,
+while segstore owns only lifecycle, naming, atomic writes and cache retention.
+
+Accepted because the five consumers diverged on the mechanics, not on the
+recipes: the same "exact live-id set" guard is written four different ways, and
+three consumers embed live ids in the payload while two decode the index
+(`.agents/reports/store-lifecycle-consolidation-20261101.md`). Adoption order is
+`precinct`, then `sporse`, then `vicinity` on its semver-major segstore 0.6 to
+0.7 upgrade; the older copies are retired only after two consumers use the
+shared path.
+
 ## Segstore Fit by Algorithm Family
 
 Segstore is right when the consumer can search immutable per-segment indexes and

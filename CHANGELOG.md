@@ -7,6 +7,18 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Added
+
+- `sidecar`: a consumer-owned sidecar lifecycle. `SidecarCodec` keeps magic,
+  version, kind, recipe id and byte encoding with the consumer; `SidecarHost` is
+  implemented for `SegmentedStore`, `SegmentCatalog` and `View`; `SidecarCache`
+  provides `get_or_build`, `invalidate`, `retain`, `persist` and
+  `persist_missing` keyed by `(segment_id, live_ids)`. Adds `LiveIds`,
+  `SidecarKey`, `SegmentedStore::live_ids`, `SegmentCatalog::live_ids` and
+  `View::live_ids`, plus `View::dir` and `View::index_name`. Existing APIs and
+  behaviour are unchanged; the accepted decision is recorded in
+  [the sidecar design note](docs/segstore-durability-sidecars.md).
+
 ### Fixed
 
 - A checkpoint whose manifest write fails now poisons the store: later `add`,

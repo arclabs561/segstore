@@ -54,9 +54,8 @@ checkpoint also serializes the current segment IDs, tombstones, and
 superseded-copy metadata.
 
 Recovery loads the manifest's segment files and replays only the current epoch's
-WAL. `SyncPolicy::Fsync` (via `open_with_options`) syncs every WAL record to stable
-storage; the default flushes to the OS without a
-per-op fsync.
+WAL. `SyncPolicy::Fsync` (via `open_with_options`) syncs every WAL record to
+stable storage; the default flushes to the OS without a per-op fsync.
 
 ## Memory model
 
@@ -66,32 +65,20 @@ returns those in-memory segments. That is the right shape for fast embedded
 indexes whose active segment set fits RAM, and for caching expensive per-segment
 sidecars across restarts.
 
-For corpora larger than memory, segstore is not yet a complete out-of-core
-reader. The next layer needs a reader/open path that can expose stable segment
-ids and segment file handles (or mmap-backed consumer readers) without
-deserializing each payload. `durability` provides filesystem paths;
-the missing piece is a segstore API that keeps the
-manifest/GC/checkpoint guarantees while letting consumers stream or map their own
-segment formats.
+There is no out-of-core reader yet for corpora larger than memory; see
+[docs/out-of-core-segment-reader.md](docs/out-of-core-segment-reader.md) for the
+proposed design.
 
-`SegmentCatalog` can inspect the checkpoint manifest without opening segment
-payload files, report a segment payload's file offset/length/CRC, read one
-segment's validated serialized payload bytes into an owned or caller-reused
-buffer, or decode one requested segment for sidecar rebuilds. It is still a
-catalog helper for loaders and diagnostics, not a byte-native query reader.
+`SegmentCatalog` reads the checkpoint manifest without opening segment files.
+From there it can report one segment's file offset, length, and CRC, read its
+validated payload bytes, or decode it for a sidecar rebuild. It is a catalog
+helper for loaders and diagnostics, not a byte-native query reader.
 The catalog boundary is precise: segment bytes are the source payload as written,
 and liveness is exposed separately through `is_live_in`. Consumers that decode or
 map segment bytes must apply liveness and their own query metadata; segstore does
 not convert source payloads into a live query view. Consumers that mmap or
 range-read bytes from `SegmentPayloadInfo` should call
 `SegmentPayloadInfo::verify_payload` before trusting those bytes.
-
-Nonempty legacy manifests without per-copy ownership metadata are rejected by
-`SegmentCatalog::open`. Writer recovery followed by checkpoint can upgrade
-stores whose duplicate IDs occur in different segments. Repeated live IDs within
-one segment are rejected during recovery; use a known-good generation or rebuild
-from validated latest-per-ID records in that case. Empty legacy stores remain
-readable. Catalog open never scans segment payloads to resolve this ambiguity.
 
 For byte-native query paths, use consumer sidecars. `segstore` reserves and
 garbage-collects `segstore.idx.<segment-id>.<kind>` next to the source segment,
@@ -127,14 +114,24 @@ performs), so writes since then become visible after the next checkpoint. This i
 the Lucene `SearcherManager` / Tantivy `Searcher` model, made light by segstore's
 in-memory segments (a `View` is `Arc` clones; an old segment's memory frees when
 the last view holding it drops). Publishing only at the checkpoint keeps the
-snapshot off the ingest hot path -- republishing per write would make bulk ingest
+snapshot off the ingest hot path; republishing per write would make bulk ingest
 quadratic. `View::segment_ids()` plus `try_index_name(id, kind)` lets readers load
 consumer sidecars without holding the writer.
 
 ## Examples
 
-See [examples/README.md](examples/README.md) for runnable examples with
-captured output.
+```bash
+cargo run --release --example inverted_index
+```
+
+```text
+indexed 4 docs; df(rust)=3
+after delete(1): df(rust)=2
+  [PASS] segstore backs an updatable inverted index: build, delete, compact, recover
+```
+
+[examples/README.md](examples/README.md) covers the other examples (vector
+search, sidecars) with captured output.
 
 ## Status
 

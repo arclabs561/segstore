@@ -15,7 +15,7 @@ any other updatable structure.
 
 ```toml
 [dependencies]
-segstore = "0.7"
+segstore = "0.8"
 durability = "0.9"
 ```
 

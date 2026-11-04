@@ -109,6 +109,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
+pub mod sidecar;
 
 /// Prefix for epoch-suffixed WAL files (`segstore.wal.<epoch>`).
 const WAL_PREFIX: &str = "segstore.wal.";
@@ -1235,6 +1236,21 @@ where
         try_index_name(id, kind)
     }
 
+    /// Canonical live-id set of one checkpointed segment.
+    ///
+    /// `ids` must be the ids of the copies stored in `segment_id` (the consumer
+    /// enumerates them from its own decoded segment); segstore filters them by
+    /// [`Self::is_live_in`] and returns them sorted and deduped. A
+    /// [`SegmentCatalog`] cannot enumerate a segment's ids itself because it
+    /// does not hold a [`Store`] value.
+    pub fn live_ids<I>(&self, segment_id: u64, ids: I) -> crate::sidecar::LiveIds<Id>
+    where
+        Id: Ord,
+        I: IntoIterator<Item = Id>,
+    {
+        crate::sidecar::LiveIds::new(ids.into_iter().filter(|id| self.is_live_in(segment_id, id)))
+    }
+
     /// Infallible convenience wrapper around [`Self::try_index_name`].
     ///
     /// Panics if `id` is not in this catalog or `kind` violates the documented
@@ -1271,6 +1287,7 @@ pub struct View<S: Store> {
     segment_ids: Arc<Vec<u64>>,
     tombstones: Arc<HashSet<S::Id>>,
     superseded: Arc<HashMap<u64, HashSet<S::Id>>>,
+    dir: Arc<dyn Directory>,
 }
 
 impl<S: Store> View<S> {
@@ -1290,6 +1307,35 @@ impl<S: Store> View<S> {
         &self.segment_ids
     }
 
+    /// The directory this snapshot's segments live in.
+    ///
+    /// Together with [`Self::try_index_name`] this lets a reader/searcher resolve
+    /// `segstore.idx.<id>.<kind>` without holding the writer, so a snapshot can
+    /// load a persisted sidecar instead of rebuilding it.
+    pub fn dir(&self) -> &Arc<dyn Directory> {
+        &self.dir
+    }
+
+    /// Reserved sidecar file name for a per-segment index of the given `kind`,
+    /// for a segment in this snapshot.
+    pub fn try_index_name(&self, id: u64, kind: &str) -> PersistenceResult<String> {
+        if self.segment_ids.binary_search(&id).is_err() {
+            return Err(PersistenceError::NotFound(format!(
+                "segment id {id} is not in this view"
+            )));
+        }
+        try_index_name(id, kind)
+    }
+
+    /// Infallible convenience wrapper around [`Self::try_index_name`].
+    ///
+    /// Panics if `id` is not in this snapshot or `kind` violates the documented
+    /// sidecar-kind grammar.
+    pub fn index_name(&self, id: u64, kind: &str) -> String {
+        self.try_index_name(id, kind)
+            .unwrap_or_else(|e| panic!("invalid segstore view index name: {e}"))
+    }
+
     /// Whether `id` is not tombstoned in this snapshot.
     ///
     /// This is per-id: when a re-added id has copies in several segments, it is
@@ -1307,6 +1353,21 @@ impl<S: Store> View<S> {
         copy_is_live(&self.tombstones, &self.superseded, segment_id, id)
     }
 
+    /// Canonical live-id set of one segment in this snapshot.
+    ///
+    /// `ids` must be the ids of the copies stored in `segment_id` (the consumer
+    /// enumerates them from its own decoded segment); segstore filters them by
+    /// [`Self::is_live_in`] and returns them sorted and deduped. A [`View`]
+    /// cannot enumerate a segment's ids itself because it holds no [`Store`]
+    /// value.
+    pub fn live_ids<I>(&self, segment_id: u64, ids: I) -> crate::sidecar::LiveIds<S::Id>
+    where
+        S::Id: Ord,
+        I: IntoIterator<Item = S::Id>,
+    {
+        crate::sidecar::LiveIds::new(ids.into_iter().filter(|id| self.is_live_in(segment_id, id)))
+    }
+
     /// Number of segments in this snapshot.
     pub fn segment_count(&self) -> usize {
         self.segments.len()
@@ -1317,12 +1378,14 @@ impl<S: Store> View<S> {
 /// mutates. Obtain via [`SegmentedStore::reader`]; clone freely across threads.
 pub struct Reader<S: Store> {
     published: Arc<std::sync::RwLock<Arc<PubState<S>>>>,
+    dir: Arc<dyn Directory>,
 }
 
 impl<S: Store> Clone for Reader<S> {
     fn clone(&self) -> Self {
         Reader {
             published: self.published.clone(),
+            dir: self.dir.clone(),
         }
     }
 }
@@ -1338,6 +1401,7 @@ impl<S: Store> Reader<S> {
             segment_ids: state.segment_ids.clone(),
             tombstones: state.tombstones.clone(),
             superseded: state.superseded.clone(),
+            dir: self.dir.clone(),
         }
     }
 }
@@ -1615,6 +1679,7 @@ impl<S: Store> SegmentedStore<S> {
     pub fn reader(&self) -> Reader<S> {
         Reader {
             published: self.published.clone(),
+            dir: self.dir.clone(),
         }
     }
 
@@ -2342,6 +2407,24 @@ impl<S: Store> SegmentedStore<S> {
     /// segment's cache entry, without scanning segments for the id.
     pub fn live_segment_of(&self, id: &S::Id) -> Option<u64> {
         self.owners.as_ref()?.get(id).copied()
+    }
+
+    /// Canonical live-id set of one sealed segment: the segment's ids filtered
+    /// by [`Self::is_live_in`], sorted and deduped.
+    ///
+    /// This is the fingerprint a sidecar cache keys on. Returns `None` if
+    /// `segment_id` is not a current segment or the store's [`Store`]
+    /// implementation does not list ids ([`Store::item_ids`]). Buffered adds are
+    /// not part of any segment's live-id set.
+    pub fn live_ids(&self, segment_id: u64) -> Option<crate::sidecar::LiveIds<S::Id>>
+    where
+        S::Id: Ord,
+    {
+        let position = self.segment_ids.iter().position(|&id| id == segment_id)?;
+        let ids = self.store.item_ids(&self.segments[position])?;
+        Some(crate::sidecar::LiveIds::new(
+            ids.into_iter().filter(|id| self.is_live_in(segment_id, id)),
+        ))
     }
 
     /// Number of immutable segments.

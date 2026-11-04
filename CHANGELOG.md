@@ -9,6 +9,9 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Fixed
 
+- `open` deletes `segstore.seg.<id>.tmp` files left by a crash inside a
+  segment write. Segment ids are never reused, so these files were never
+  overwritten or reclaimed and each crash could leak up to one segment of disk.
 - A checkpoint whose manifest write fails now poisons the store: later `add`,
   `extend`, `delete`, and `checkpoint` calls return `InvalidState`. The durable
   manifest write can fail after the new manifest is already visible; reopen then

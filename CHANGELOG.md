@@ -7,6 +7,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-04
+
 ### Added
 
 - `sidecar`: a consumer-owned sidecar lifecycle. `SidecarCodec` keeps magic,

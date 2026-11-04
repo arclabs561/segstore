@@ -1532,7 +1532,10 @@ impl<S: Store> SegmentedStore<S> {
         // Best-effort GC of crash leftovers: stale WAL generations (any
         // `segstore.wal.<k>` with k != epoch is superseded by the manifest) and
         // orphan segment files (any `segstore.seg.<k>` the manifest does not name,
-        // left by a crash between a segment write and the manifest write).
+        // left by a crash between a segment write and the manifest write), and
+        // `segstore.seg.<k>.tmp` files left by a crash inside a segment's atomic
+        // write. Segment ids are never reused, so nothing else would replace them;
+        // the writer lock is held, so no segment write is in flight.
         if let Ok(names) = dir.list_dir("") {
             let mut garbage = Vec::new();
             for name in names {
@@ -1543,6 +1546,12 @@ impl<S: Store> SegmentedStore<S> {
                     if k != epoch {
                         garbage.push(name);
                     }
+                } else if name
+                    .strip_prefix(SEG_PREFIX)
+                    .and_then(|s| s.strip_suffix(".tmp"))
+                    .is_some_and(|s| s.parse::<u64>().is_ok())
+                {
+                    garbage.push(name);
                 } else if let Some(k) = name
                     .strip_prefix(SEG_PREFIX)
                     .and_then(|s| s.parse::<u64>().ok())
@@ -3626,6 +3635,29 @@ mod tests {
 
         let dir = durability::FsDirectory::arc(&root).unwrap();
         let s2 = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert_eq!(live_set(&s2), vec![(1, "a".into()), (2, "b".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_reclaims_a_segment_tmp_left_by_a_crash() {
+        let root = temp_root("stale-seg-tmp");
+        {
+            let dir = durability::FsDirectory::arc(&root).unwrap();
+            let mut s = SegmentedStore::open(dir, Kv, 2).unwrap();
+            s.add(1, "a".into()).unwrap();
+            s.add(2, "b".into()).unwrap();
+            s.checkpoint().unwrap();
+        }
+        // A crash inside a segment's atomic write, before the rename, leaves
+        // `<segment>.tmp`. Segment ids are never reused, so no later write
+        // replaces it; open must delete it.
+        let tmp = root.join(format!("{}.tmp", seg_path(9)));
+        std::fs::write(&tmp, vec![0u8; 4096]).unwrap();
+
+        let dir = durability::FsDirectory::arc(&root).unwrap();
+        let s2 = SegmentedStore::open(dir, Kv, 2).unwrap();
+        assert!(!tmp.exists(), "segment tmp survived open");
         assert_eq!(live_set(&s2), vec![(1, "a".into()), (2, "b".into())]);
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -17,7 +17,8 @@ unstable: minor bumps may break the public API and the on-disk format.
   `SidecarKey`, `SegmentedStore::live_ids`, `SegmentCatalog::live_ids` and
   `View::live_ids`, plus `View::dir` and `View::index_name`. Existing APIs and
   behaviour are unchanged; the accepted decision is recorded in
-  [the sidecar design note](docs/segstore-durability-sidecars.md).
+  [the sidecar design note](docs/segstore-durability-sidecars.md). First
+  published in 0.7.3.
 
 ### Fixed
 

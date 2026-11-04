@@ -21,12 +21,22 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ### Fixed
 
+- `open` deletes `segstore.seg.<id>.tmp` files left by a crash inside a
+  segment write. Segment ids are never reused, so these files were never
+  overwritten or reclaimed and each crash could leak up to one segment of disk.
 - A checkpoint whose manifest write fails now poisons the store: later `add`,
   `extend`, `delete`, and `checkpoint` calls return `InvalidState`. The durable
   manifest write can fail after the new manifest is already visible; reopen then
   deletes the WAL generation the store was still appending to, which silently
   lost writes acknowledged after the failed checkpoint. Reopen the store to
   recover.
+- A merge whose output cannot be written (a segment over the 256 MiB per-blob
+  cap, or an IO error) now fails `compact`, `compact_tiers`, `force_merge_to`,
+  or `reclaim_tombstones` and leaves the segment set unchanged. Before, the
+  unwritable merged segment stayed in memory, so every later `checkpoint`
+  failed on it: readers stopped advancing and the WAL grew until reopen. The
+  merged segment file is now written before the merge is applied in memory;
+  no on-disk format change.
 
 ## [0.7.2] - 2026-10-12
 

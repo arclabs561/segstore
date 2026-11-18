@@ -7,6 +7,8 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-18
+
 ### Fixed
 
 - Re-adding a deleted ID after opening a legacy checkpoint now leaves its old
@@ -326,7 +328,8 @@ Initial release: the `Store` trait, `SegmentedStore` with a write-ahead log,
 immutable segments, tombstone deletes, checkpoint snapshots, full compaction, and
 crash recovery, on top of `durability`.
 
-[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/arclabs561/segstore/compare/v0.8.0...v0.8.1
 [0.7.2]: https://github.com/arclabs561/segstore/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/arclabs561/segstore/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/arclabs561/segstore/compare/v0.6.1...v0.7.0

@@ -16,7 +16,7 @@ include = ["/src", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LIC
 
 [dependencies]
 crc32fast = "1"
-durability = "0.9"
+durability = "0.10"
 fs4 = "0.13"
 serde = { version = "1", features = ["derive"] }
 

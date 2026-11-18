@@ -7,6 +7,11 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Fixed
+
+- Re-adding a deleted ID after opening a legacy checkpoint now leaves its old
+  segment copies hidden, including when the replacement is replayed from the WAL.
+
 ## [0.8.0] - 2026-11-04
 
 ### Added

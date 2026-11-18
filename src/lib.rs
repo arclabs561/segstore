@@ -1562,7 +1562,13 @@ impl<S: Store> SegmentedStore<S> {
                 break;
             };
             for id in ids {
-                if !copy_is_live(&tombstones, &superseded, seg_id, &id) {
+                // Legacy deletes recorded only a global tombstone. A re-add
+                // clears it, so mark each sealed copy permanently superseded.
+                if tombstones.contains(&id) {
+                    superseded.entry(seg_id).or_default().insert(id);
+                    continue;
+                }
+                if superseded.get(&seg_id).is_some_and(|ids| ids.contains(&id)) {
                     continue;
                 }
                 if let Some(older) = map.insert(id.clone(), seg_id) {
@@ -3045,6 +3051,38 @@ mod tests {
             ids.sort_unstable();
         }
         assert_eq!(superseded, vec![(0, vec![1, 2])]);
+    }
+
+    #[test]
+    fn re_add_after_legacy_delete_keeps_every_old_copy_hidden() {
+        let dir = MemoryDirectory::arc();
+        let mut s = re_add_across_segments(dir.clone());
+        s.delete(1).unwrap();
+        s.checkpoint().unwrap();
+        let legacy = LegacyTestManifest {
+            next_seg_id: 2,
+            segment_ids: vec![0, 1],
+            tombstones: vec![1],
+        };
+        CheckpointFile::new(dir.clone())
+            .write_postcard(MANIFEST_PATH, s.epoch(), &legacy)
+            .unwrap();
+        drop(s);
+
+        let mut s = SegmentedStore::open(dir.clone(), Dkv::new(), 2).unwrap();
+        let held = s.reader().view();
+        let before = kv(&[(2, "x"), (3, "y")]);
+        let after = kv(&[(1, "new"), (2, "x"), (3, "y")]);
+        assert_eq!(view_latest(&held), before);
+        s.add(1, "new".into()).unwrap();
+        assert_eq!(writer_latest(&s), after);
+        drop(s);
+
+        let mut s = SegmentedStore::open(dir.clone(), Dkv::new(), 2).unwrap();
+        assert_eq!(writer_latest(&s), after, "WAL replay");
+        s.checkpoint().unwrap();
+        assert_eq!(catalog_latest(dir), after);
+        assert_eq!(view_latest(&held), before);
     }
 
     #[test]

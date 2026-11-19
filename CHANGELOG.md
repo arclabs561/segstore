@@ -13,6 +13,9 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 - Re-adding a deleted ID after opening a legacy checkpoint now leaves its old
   segment copies hidden, including when the replacement is replayed from the WAL.
+- A shared `SidecarCache` now checks the directory handle before reusing or
+  persisting an entry. Stores with matching segment and document IDs could
+  previously read or write another store's index.
 
 ## [0.7.3] - 2026-11-01
 

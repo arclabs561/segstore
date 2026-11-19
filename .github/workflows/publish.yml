@@ -1,0 +1,100 @@
+name: Publish segstore
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source branch
+        required: true
+        type: choice
+        options:
+          - main
+          - maintenance/0.7
+      version:
+        description: Exact segstore version in Cargo.toml
+        required: true
+        type: string
+      expected_sha:
+        description: Full source SHA from the dry run (required for publishing)
+        type: string
+      publish:
+        description: Publish this exact version and SHA to crates.io
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main' && (inputs.source == 'main' || inputs.source == 'maintenance/0.7')
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/heads/${{ inputs.source }}
+          persist-credentials: false
+      - name: Check source and package version
+        id: check
+        env:
+          SOURCE: ${{ inputs.source }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import tomllib
+
+          env = os.environ
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          with open("Cargo.toml", "rb") as manifest:
+              package = tomllib.load(manifest)["package"]
+          line = {"main": "0.8", "maintenance/0.7": "0.7"}[env["SOURCE"]]
+          if package["name"] != "segstore" or package["version"] != env["VERSION"]:
+              raise SystemExit("Enter the exact segstore version from the selected branch")
+          if not re.fullmatch(re.escape(line) + r"\.(0|[1-9][0-9]*)", env["VERSION"]):
+              raise SystemExit(f"The selected branch only publishes stable {line}.x versions")
+          if env["PUBLISH"] == "true" and not env["EXPECTED_SHA"]:
+              raise SystemExit("Copy the full source SHA from a successful dry run")
+          if env["EXPECTED_SHA"] and env["EXPECTED_SHA"] != sha:
+              raise SystemExit("The selected branch has moved or the expected SHA is incorrect")
+          with open(env["GITHUB_OUTPUT"], "a") as output:
+              print(f"sha={sha}", file=output)
+          with open(env["GITHUB_STEP_SUMMARY"], "a") as summary:
+              print(f"segstore {package['version']} from {env['SOURCE']} at `{sha}`", file=summary)
+          PY
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - run: cargo publish --dry-run --registry crates-io
+
+  publish:
+    if: github.ref == 'refs/heads/main' && inputs.publish
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: publish-segstore
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+        id: auth
+      - name: Publish verified source
+        run: cargo publish --no-verify --registry crates-io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

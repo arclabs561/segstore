@@ -1,0 +1,53 @@
+name: Verify manual publishing without credentials
+on:
+  push:
+    branches: [ci/check-manual-publish]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - source: main
+            version: 0.8.1
+          - source: maintenance/0.7
+            version: 0.7.4
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: refs/heads/${{ matrix.source }}
+          path: package
+          persist-credentials: false
+      - name: Lint proposed workflow
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@a443f344ff32813837fa49f7aa6cbc478d770e62 .github/workflows/publish.yml
+      - name: Extract and exercise exact embedded guard
+        env:
+          SOURCE: ${{ matrix.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          ruby -ryaml -e 'puts YAML.load_file(".github/workflows/publish.yml").fetch("jobs").fetch("verify").fetch("steps").find { |s| s["id"] == "check" }.fetch("run")' > "$RUNNER_TEMP/version-guard.sh"
+          cd package
+          export GITHUB_OUTPUT="$RUNNER_TEMP/test-output" GITHUB_STEP_SUMMARY="$RUNNER_TEMP/test-summary"
+          sha=$(git rev-parse HEAD)
+          run_guard() { env "$@" bash "$RUNNER_TEMP/version-guard.sh"; }
+          reject() { if run_guard "$@"; then echo "Guard unexpectedly accepted invalid inputs"; exit 1; fi; }
+          run_guard PUBLISH=false EXPECTED_SHA=
+          run_guard PUBLISH=true EXPECTED_SHA="$sha"
+          reject PUBLISH=true EXPECTED_SHA=
+          reject PUBLISH=true EXPECTED_SHA=0000000000000000000000000000000000000000
+          reject PUBLISH=false EXPECTED_SHA=wrong
+          reject PUBLISH=false EXPECTED_SHA= VERSION=0.1.99
+          if [ "$SOURCE" = main ]; then other=maintenance/0.7; else other=main; fi
+          reject PUBLISH=false EXPECTED_SHA= SOURCE="$other"
+          grep -Fx "sha=$sha" "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - name: Run actual dry command against source checkout
+        working-directory: package
+        run: cargo publish --dry-run --registry crates-io

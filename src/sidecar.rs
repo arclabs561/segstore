@@ -115,7 +115,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use durability::{Directory, PersistenceError, PersistenceResult};
 use serde::de::DeserializeOwned;
@@ -352,15 +352,28 @@ impl<S: Store> SidecarHost for View<S> {
 /// In-memory sidecar cache with write-through helpers, keyed by
 /// `(segment_id, live ids)`.
 ///
-/// See the module docs for the ownership split, thread safety, and stale-entry
-/// behavior.
+/// Segment ids are local to their store. A memory entry is reused or persisted
+/// only through the same directory handle; views, catalogs and writers can share
+/// that handle. A separately opened directory can still load its own disk sidecar.
+/// See the module docs for the ownership split, thread safety, and stale-entry behavior.
 pub struct SidecarCache<C: SidecarCodec> {
     codec: C,
     entries: Mutex<EntryMap<C::Id, C::Index>>,
 }
 
 /// Cached entry table: one built index per `(segment id, live ids)`.
-type EntryMap<Id, Index> = HashMap<SidecarKey<Id>, Arc<Index>>;
+type EntryMap<Id, Index> = HashMap<SidecarKey<Id>, CachedIndex<Index>>;
+
+struct CachedIndex<Index> {
+    directory: Weak<dyn Directory>,
+    index: Arc<Index>,
+}
+
+impl<Index> CachedIndex<Index> {
+    fn belongs_to(&self, directory: &Arc<dyn Directory>) -> bool {
+        std::ptr::addr_eq(self.directory.as_ptr(), Arc::as_ptr(directory))
+    }
+}
 
 /// One `(key, index)` pair lifted out of the cache for persistence.
 type Entry<Id, Index> = (SidecarKey<Id>, Arc<Index>);
@@ -423,16 +436,19 @@ impl<C: SidecarCodec> SidecarCache<C> {
         F: FnOnce() -> Option<C::Index>,
     {
         let mut entries = self.entries();
-        if let Some(hit) = entries.get(&key) {
-            return Some(hit.clone());
+        if let Some(hit) = entries
+            .get(&key)
+            .filter(|hit| hit.belongs_to(host.sidecar_dir()))
+        {
+            return Some(hit.index.clone());
         }
         if let Some(index) = self.load(host, &key) {
             let index = Arc::new(index);
-            Self::insert(&mut entries, key, index.clone());
+            Self::insert(&mut entries, key, index.clone(), host.sidecar_dir());
             return Some(index);
         }
         let index = Arc::new(build()?);
-        Self::insert(&mut entries, key, index.clone());
+        Self::insert(&mut entries, key, index.clone(), host.sidecar_dir());
         Some(index)
     }
 
@@ -442,8 +458,9 @@ impl<C: SidecarCodec> SidecarCache<C> {
     /// id in that segment), so neither the memory entry nor the file can be
     /// served for the old set.
     pub fn invalidate<H: SidecarHost>(&self, host: &H, segment_id: u64) -> PersistenceResult<()> {
-        self.entries()
-            .retain(|key, _| key.segment_id() != segment_id);
+        self.entries().retain(|key, cached| {
+            key.segment_id() != segment_id || !cached.belongs_to(host.sidecar_dir())
+        });
         let name = host.try_sidecar_name(segment_id, self.codec.kind())?;
         host.delete_sidecar(&name)
     }
@@ -468,7 +485,12 @@ impl<C: SidecarCodec> SidecarCache<C> {
         host: &H,
         key: &SidecarKey<C::Id>,
     ) -> PersistenceResult<bool> {
-        let Some(index) = self.entries().get(key).cloned() else {
+        let index = self
+            .entries()
+            .get(key)
+            .filter(|cached| cached.belongs_to(host.sidecar_dir()))
+            .map(|cached| cached.index.clone());
+        let Some(index) = index else {
             return Ok(false);
         };
         let bytes = self.encode_envelope(key, &index)?;
@@ -492,8 +514,10 @@ impl<C: SidecarCodec> SidecarCache<C> {
             let entries = self.entries();
             entries
                 .iter()
-                .filter(|(key, _)| segment_ids.contains(&key.segment_id()))
-                .map(|(key, index)| (key.clone(), index.clone()))
+                .filter(|(key, cached)| {
+                    cached.belongs_to(host.sidecar_dir()) && segment_ids.contains(&key.segment_id())
+                })
+                .map(|(key, cached)| (key.clone(), cached.index.clone()))
                 .collect()
         };
         let mut written = 0;
@@ -555,10 +579,17 @@ impl<C: SidecarCodec> SidecarCache<C> {
         entries: &mut EntryMap<C::Id, C::Index>,
         key: SidecarKey<C::Id>,
         index: Arc<C::Index>,
+        directory: &Arc<dyn Directory>,
     ) {
         let segment_id = key.segment_id();
         entries.retain(|existing, _| existing.segment_id() != segment_id);
-        entries.insert(key, index);
+        entries.insert(
+            key,
+            CachedIndex {
+                directory: Arc::downgrade(directory),
+                index,
+            },
+        );
     }
 
     fn entries(&self) -> MutexGuard<'_, EntryMap<C::Id, C::Index>> {
@@ -680,6 +711,36 @@ mod tests {
             .expect("loaded from the persisted sidecar");
         assert_eq!(loaded.as_slice(), &[1, 2]);
         assert_eq!(builds, 1, "the persisted sidecar was loaded, not rebuilt");
+    }
+
+    #[test]
+    fn cache_entries_cannot_cross_independent_snapshots_or_directories() {
+        let (dir_a, store_a) = sealed_store();
+        let (dir_b, store_b) = sealed_store();
+        let view_a = store_a.reader().view();
+        let view_b = store_b.reader().view();
+        let seg = view_a.segment_ids()[0];
+        assert_eq!(view_b.segment_ids(), &[seg]);
+        let key = key(seg, &[1, 2]);
+        let cache = SidecarCache::new(IdListCodec);
+
+        let from_a = cache
+            .get_or_build(&view_a, key.clone(), || Some(vec![1, 2]))
+            .unwrap();
+        assert!(!cache.persist(&view_b, &key).unwrap());
+        assert_eq!(cache.persist_missing(&view_b, &[seg]).unwrap(), 0);
+        assert!(!dir_b.exists(&view_b.index_name(seg, "toy")));
+        cache.invalidate(&view_b, seg).unwrap();
+        assert!(cache.persist(&store_a, &key).unwrap());
+        assert!(dir_a.exists(&view_a.index_name(seg, "toy")));
+
+        let from_b = cache
+            .get_or_build(&view_b, key.clone(), || Some(vec![1, 2]))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&from_a, &from_b));
+        let catalog_b = SegmentCatalog::<u32>::open(dir_b).unwrap();
+        let hit = cache.get_or_build(&catalog_b, key, || None).unwrap();
+        assert!(Arc::ptr_eq(&from_b, &hit));
     }
 
     #[test]

@@ -133,6 +133,31 @@ after delete(1): df(rust)=2
 [examples/README.md](examples/README.md) covers the other examples (vector
 search, sidecars) with captured output.
 
+## Publishing
+
+Open **Actions → Publish segstore → Run workflow**. Leave the workflow branch on
+`main`. Select the source branch (`main` for 0.8.x, `maintenance/0.7` for 0.7.x),
+enter the exact version in its `Cargo.toml`, and run with the publish box
+unchecked. Cargo packages and verifies the crate. The successful run summary
+shows the full source SHA.
+
+To publish, run the same workflow from `main` with the same source and version,
+paste that SHA into **Full source SHA**, and check **Publish**. A branch change
+requires a fresh dry run. The live job checks out the verified commit and
+exchanges GitHub's identity token for a short-lived crates.io token.
+
+Before the first live run, a repository administrator should restrict the GitHub
+environment `crates-io` to deployments from the `main` branch only (no tags).
+A crate owner must confirm or add this entry under **segstore → Settings →
+Trusted Publishing** on crates.io:
+
+| Setting | Value |
+| --- | --- |
+| Repository owner | `arclabs561` |
+| Repository name | `segstore` |
+| Workflow filename | `publish.yml` |
+| Environment | `crates-io` |
+
 ## Status
 
 0.x; the API and on-disk format may change between minor versions.

@@ -10,10 +10,6 @@ on:
         options:
           - main
           - maintenance/0.7
-      version:
-        description: Exact segstore version in Cargo.toml
-        required: true
-        type: string
       expected_sha:
         description: Full source SHA from the dry run (required for publishing)
         type: string
@@ -40,7 +36,6 @@ jobs:
         id: check
         env:
           SOURCE: ${{ inputs.source }}
-          VERSION: ${{ inputs.version }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           PUBLISH: ${{ inputs.publish }}
         run: |
@@ -55,9 +50,9 @@ jobs:
           with open("Cargo.toml", "rb") as manifest:
               package = tomllib.load(manifest)["package"]
           line = {"main": "0.8", "maintenance/0.7": "0.7"}[env["SOURCE"]]
-          if package["name"] != "segstore" or package["version"] != env["VERSION"]:
-              raise SystemExit("Enter the exact segstore version from the selected branch")
-          if not re.fullmatch(re.escape(line) + r"\.(0|[1-9][0-9]*)", env["VERSION"]):
+          if package["name"] != "segstore":
+              raise SystemExit("Expected a segstore package in Cargo.toml")
+          if not re.fullmatch(re.escape(line) + r"\.(0|[1-9][0-9]*)", package["version"]):
               raise SystemExit(f"The selected branch only publishes stable {line}.x versions")
           if env["PUBLISH"] == "true" and not env["EXPECTED_SHA"]:
               raise SystemExit("Copy the full source SHA from a successful dry run")

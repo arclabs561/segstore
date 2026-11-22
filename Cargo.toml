@@ -17,6 +17,8 @@ include = ["/src", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LIC
 [dependencies]
 crc32fast = "1"
 durability = "0.9"
+# Keep durability's checkpoint codec within the declared Rust 1.80 minimum.
+postcard = { version = ">=1.0, <1.2", default-features = false }
 fs4 = "0.13"
 serde = { version = "1", features = ["derive"] }
 

@@ -7,6 +7,14 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Storage APIs now accept the directory and error types from durability 0.10.
+  Downstream crates can import the matching types from `segstore::durability`.
+- Existing v1 write-ahead logs can be reopened and appended. Newly created logs,
+  including the next log written after a checkpoint, use v2. Before upgrading,
+  keep a copy of the store if you need to roll back to segstore 0.8.
+
 ## [0.8.2] - 2026-11-21
 
 ### Fixed

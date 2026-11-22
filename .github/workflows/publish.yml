@@ -49,7 +49,7 @@ jobs:
           sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           with open("Cargo.toml", "rb") as manifest:
               package = tomllib.load(manifest)["package"]
-          line = {"main": "0.8", "maintenance/0.7": "0.7"}[env["SOURCE"]]
+          line = {"main": "0.9", "maintenance/0.7": "0.7"}[env["SOURCE"]]
           if package["name"] != "segstore":
               raise SystemExit("Expected a segstore package in Cargo.toml")
           if not re.fullmatch(re.escape(line) + r"\.(0|[1-9][0-9]*)", package["version"]):

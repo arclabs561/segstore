@@ -54,9 +54,10 @@ jobs:
               raise SystemExit("Expected a segstore package in Cargo.toml")
           if not re.fullmatch(re.escape(line) + r"\.(0|[1-9][0-9]*)", package["version"]):
               raise SystemExit(f"The selected branch only publishes stable {line}.x versions")
-          if env["PUBLISH"] == "true" and not env["EXPECTED_SHA"]:
+          expected_sha = env["EXPECTED_SHA"].strip()
+          if env["PUBLISH"] == "true" and not expected_sha:
               raise SystemExit("Copy the full source SHA from a successful dry run")
-          if env["EXPECTED_SHA"] and env["EXPECTED_SHA"] != sha:
+          if expected_sha and expected_sha != sha:
               raise SystemExit("The selected branch has moved or the expected SHA is incorrect")
           with open(env["GITHUB_OUTPUT"], "a") as output:
               print(f"sha={sha}", file=output)

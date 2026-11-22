@@ -136,12 +136,11 @@ search, sidecars) with captured output.
 ## Publishing
 
 Open **Actions → Publish segstore → Run workflow**. Leave the workflow branch on
-`main`. Select the source branch (`main` for 0.8.x, `maintenance/0.7` for 0.7.x),
-enter the exact version in its `Cargo.toml`, and run with the publish box
-unchecked. Cargo packages and verifies the crate. The successful run summary
-shows the full source SHA.
+`main`. Select the source branch (`main` for 0.8.x, `maintenance/0.7` for 0.7.x)
+and run with the publish box unchecked. Cargo packages and verifies the crate.
+The run summary shows the version from `Cargo.toml` and the full source SHA.
 
-To publish, run the same workflow from `main` with the same source and version,
+To publish, run the same workflow from `main` with the same source,
 paste that SHA into **Full source SHA**, and check **Publish**. A branch change
 requires a fresh dry run. The live job checks out the verified commit and
 exchanges GitHub's identity token for a short-lived crates.io token.

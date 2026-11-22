@@ -15,6 +15,14 @@ unstable: minor bumps may break the public API and the on-disk format.
   including the next log written after a checkpoint, use v2. Before upgrading,
   keep a copy of the store if you need to roll back to segstore 0.8.
 
+## [0.8.2] - 2026-11-21
+
+### Fixed
+
+- Fresh Rust 1.80 builds now resolve postcard 1.1.x for checkpoint encoding.
+  Postcard 1.2.0 requires Rust 1.88. If your lockfile already contains 1.2.0,
+  run `cargo update -p postcard --precise 1.1.3` before building on Rust 1.80.
+
 ## [0.8.1] - 2026-11-18
 
 ### Fixed
@@ -339,7 +347,8 @@ Initial release: the `Store` trait, `SegmentedStore` with a write-ahead log,
 immutable segments, tombstone deletes, checkpoint snapshots, full compaction, and
 crash recovery, on top of `durability`.
 
-[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/arclabs561/segstore/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/arclabs561/segstore/compare/8565dbf...v0.8.2
 [0.8.1]: https://github.com/arclabs561/segstore/compare/v0.8.0...v0.8.1
 [0.7.2]: https://github.com/arclabs561/segstore/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/arclabs561/segstore/compare/v0.7.0...v0.7.1

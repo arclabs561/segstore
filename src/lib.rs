@@ -29,7 +29,7 @@
 //!
 //! ```
 //! use segstore::{DefaultStore, SegmentedStore};
-//! use durability::MemoryDirectory;
+//! use segstore::durability::MemoryDirectory;
 //!
 //! let dir = MemoryDirectory::arc();
 //! let mut s = SegmentedStore::open(dir, DefaultStore::<u32, String>::new(), 2).unwrap();
@@ -101,6 +101,9 @@ use std::hash::Hash;
 use std::io::Read;
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+/// Storage backends and errors used in this crate's public API.
+pub use durability;
 
 use durability::checkpoint::{CheckpointFile, MAX_CHECKPOINT_PAYLOAD_BYTES};
 use durability::recordlog::{RecordLogReadMode, RecordLogReader, RecordLogWriter};
@@ -2648,6 +2651,43 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn legacy_wal_survives_append_checkpoint_and_reopen() {
+        use std::io::Read;
+
+        // segstore 0.8.1 / durability 0.9.1, DefaultStore<u32, String>,
+        // add(7, "old") in a fresh directory, then drop before checkpoint.
+        let old_wal = b"VRLG\x01\x00\x00\x00\x06\x00\x00\x00\xaa\xdfK\xd1\x00\x07\x03old";
+        let dir = MemoryDirectory::arc();
+        dir.atomic_write(&wal_path(0), old_wal).unwrap();
+        let header = |epoch| {
+            let mut bytes = [0; 8];
+            dir.open_file(&wal_path(epoch))
+                .unwrap()
+                .read_exact(&mut bytes)
+                .unwrap();
+            bytes
+        };
+        {
+            let mut store = SegmentedStore::open(dir.clone(), Kv, 20).unwrap();
+            assert_eq!(live_set(&store), [(7, String::from("old"))]);
+            store.add(8, String::from("appended")).unwrap();
+            assert_eq!(header(0), old_wal[..8]);
+        }
+        {
+            let mut store = SegmentedStore::open(dir.clone(), Kv, 20).unwrap();
+            assert_eq!(
+                live_set(&store),
+                [(7, String::from("old")), (8, String::from("appended"))]
+            );
+            store.checkpoint().unwrap();
+            store.delete(7).unwrap();
+            assert_eq!(header(1), *b"VRLG\x02\x00\x00\x00");
+        }
+        let store = SegmentedStore::open(dir, Kv, 20).unwrap();
+        assert_eq!(live_set(&store), [(8, String::from("appended"))]);
     }
 
     #[test]

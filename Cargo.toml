@@ -18,6 +18,8 @@ include = ["/src", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LIC
 crc32fast = "1"
 durability = "0.9"
 fs4 = "0.13"
+# durability 0.9 accepts postcard 1.2, which requires Rust 1.88.
+postcard = { version = ">=1.0, <1.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 
 [features]

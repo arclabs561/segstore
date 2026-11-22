@@ -13,11 +13,21 @@ any other updatable structure.
 
 ## Install
 
+For the published 0.8 release line, add these dependencies:
+
 ```toml
 [dependencies]
 segstore = "0.8"
 durability = "0.9"
 ```
+
+When building against the 0.9 source on `main`, import directory and error
+types from `segstore::durability`. Before opening an existing store with 0.9,
+stop the writer and back up the store if you need to return to 0.8. Version
+0.9 can append to an existing v1 write-ahead log. When there is no active log
+(for example, just after a checkpoint), its first write creates a v2 log and
+0.8 can no longer reopen that store. Restoring the backup returns to the data
+it contained. See [the changelog](CHANGELOG.md).
 
 ## Example
 
@@ -136,7 +146,7 @@ search, sidecars) with captured output.
 ## Publishing
 
 Open **Actions → Publish segstore → Run workflow**. Leave the workflow branch on
-`main`. Select the source branch (`main` for 0.8.x, `maintenance/0.7` for 0.7.x)
+`main`. Select the source branch (`main` for 0.9.x, `maintenance/0.7` for 0.7.x)
 and run with the publish box unchecked. Cargo packages and verifies the crate.
 The run summary shows the version from `Cargo.toml` and the full source SHA.
 

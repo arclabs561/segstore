@@ -7,10 +7,11 @@ unstable: minor bumps may break the public API and the on-disk format.
 
 ## [Unreleased]
 
-## [0.7.4] - 2026-11-18
+## [0.7.4] - 2026-11-22
 
 ### Fixed
 
+- Fresh Rust 1.80 consumers resolve a compatible checkpoint codec.
 - Re-adding a deleted ID after opening a legacy checkpoint now leaves its old
   segment copies hidden, including when the replacement is replayed from the WAL.
 - A shared `SidecarCache` now checks the directory handle before reusing or
